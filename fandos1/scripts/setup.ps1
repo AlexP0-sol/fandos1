@@ -1,4 +1,4 @@
-# fandos — интерактивный гид по настройке (Windows PowerShell).
+﻿# fandos — интерактивный гид по настройке (Windows PowerShell).
 # Запуск: Terminal → Run Task → "fandos: гид по настройке", либо  ./scripts/setup.ps1
 # Ничего не делает с биржами и не включает LIVE. Только локальная подготовка.
 $ErrorActionPreference = "Continue"
