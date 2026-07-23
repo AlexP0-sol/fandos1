@@ -32,13 +32,14 @@ Section "2/6  Файл окружения .env"
 if (Test-Path ".env") { Ok ".env уже существует — не трогаю." }
 else { Copy-Item ".env.example" ".env"; Ok "Создал .env из .env.example." }
 
-$envtext = Get-Content ".env" -Raw
+# читаем строго как UTF-8, иначе PS 5.1 читает в ANSI и кириллический плейсхолдер не совпадёт
+$envtext = Get-Content ".env" -Raw -Encoding UTF8
 if ($envtext -match "ЗАМЕНИТЕ_НА_base64_32_байта") {
   $bytes = New-Object 'System.Byte[]' 32
   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
   $key = [Convert]::ToBase64String($bytes)
   # простая замена литерала (без regex — base64 содержит / и +)
-  (Get-Content ".env" -Raw).Replace("ЗАМЕНИТЕ_НА_base64_32_байта", $key) | Set-Content ".env" -NoNewline
+  $envtext.Replace("ЗАМЕНИТЕ_НА_base64_32_байта", $key) | Set-Content ".env" -NoNewline -Encoding UTF8
   Ok "Сгенерировал MASTER_KEY (32 байта) и записал в .env."
   Warn "Сохраните MASTER_KEY из .env в надёжном месте."
 } else { Ok "MASTER_KEY в .env уже задан." }
