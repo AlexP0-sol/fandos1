@@ -23,17 +23,16 @@ import (
 	"github.com/thecd/fundarbitrage/internal/domain"
 	"github.com/thecd/fundarbitrage/internal/instrument"
 	"github.com/thecd/fundarbitrage/internal/marketdata"
-	"github.com/thecd/fundarbitrage/internal/orderbook"
 	"github.com/thecd/fundarbitrage/internal/strategy"
 )
 
-// Candidate — один評価енный кандидат пары long/short.
+// Candidate — один оценённый кандидат пары long/short.
 type Candidate struct {
-	Asset             domain.AssetSymbol
-	LongExchange      domain.ExchangeID
-	ShortExchange     domain.ExchangeID
-	LongSymbol        domain.ExchangeSymbol
-	ShortSymbol       domain.ExchangeSymbol
+	Asset         domain.AssetSymbol
+	LongExchange  domain.ExchangeID
+	ShortExchange domain.ExchangeID
+	LongSymbol    domain.ExchangeSymbol
+	ShortSymbol   domain.ExchangeSymbol
 
 	// Market data на момент оценки.
 	LongSnapshot  *domain.MarketSnapshot
@@ -53,7 +52,7 @@ type Candidate struct {
 	PnLBreakdown strategy.PnLBreakdown
 
 	// Scores.
-	Scores strategy.CandidateScores
+	Scores         strategy.CandidateScores
 	CompositeScore decimal.Decimal
 
 	// Eligibility.
@@ -61,22 +60,22 @@ type Candidate struct {
 	Reason   string // причина отклонения
 
 	// Metadata.
-	EvaluatedAt time.Time
+	EvaluatedAt      time.Time
 	SecondsToFunding int64 // до ближайшего funding события (min из двух ног)
 }
 
 // Config — параметры сканирования (из HotSettings раздела 5.1).
 type Config struct {
-	AllowedExchanges      []domain.ExchangeID
-	MinQuoteVolume24h     decimal.Decimal
-	MinOrderBookDepthUSDT decimal.Decimal
-	MaxDataAgeMs          int64
-	MinConfidenceLevel    domain.ConfidenceLevel
+	AllowedExchanges        []domain.ExchangeID
+	MinQuoteVolume24h       decimal.Decimal
+	MinOrderBookDepthUSDT   decimal.Decimal
+	MaxDataAgeMs            int64
+	MinConfidenceLevel      domain.ConfidenceLevel
 	MinSecondsBeforeFunding int64
-	MinExpectedNetPnL     decimal.Decimal
-	TargetQty             decimal.Decimal // целевой объём для VWAP (раздел 9)
-	FeeRateBps            decimal.Decimal // торговая комиссия в bps (для оценки)
-	Horizon               time.Duration   // горизонт удержания для funding calendar
+	MinExpectedNetPnL       decimal.Decimal
+	TargetQty               decimal.Decimal // целевой объём для VWAP (раздел 9)
+	FeeRateBps              decimal.Decimal // торговая комиссия в bps (для оценки)
+	Horizon                 time.Duration   // горизонт удержания для funding calendar
 }
 
 // Scanner — сканер кандидатов.
@@ -111,6 +110,10 @@ func (s *Scanner) Scan(cfg Config, now time.Time) []Candidate {
 				if !allowed[shortIns.Exchange] {
 					continue
 				}
+				// Обе ноги на одной бирже — не funding-арбитраж между биржами (раздел 8.1).
+				if longIns.Exchange == shortIns.Exchange {
+					continue
+				}
 				cand := s.evaluatePair(cfg, longIns, shortIns, now)
 				if cand != nil {
 					candidates = append(candidates, *cand)
@@ -120,7 +123,8 @@ func (s *Scanner) Scan(cfg Config, now time.Time) []Candidate {
 	}
 
 	// Ранжирование: eligible первыми, по убыванию ExpectedNetPnL.
-	sort.Slice(candidates, func(i, j int) bool {
+	// SliceStable — детерминированный порядок при равных Net (воспроизводимость UI/тестов).
+	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].Eligible != candidates[j].Eligible {
 			return candidates[i].Eligible // eligible выше
 		}
@@ -166,6 +170,10 @@ func (s *Scanner) evaluatePair(cfg Config, longIns, shortIns domain.CanonicalIns
 		cand.Reason = "missing BBO for basis"
 		return cand
 	}
+	if !longSnap.MarkPrice.IsPositive() {
+		cand.Reason = "missing mark price for notional"
+		return cand
+	}
 	cand.LongEntryVWAP = longSnap.BestAsk
 	cand.ShortEntryVWAP = shortSnap.BestBid
 	// EntryBasisRaw = ShortBestBid / LongBestAsk - 1 (раздел 3.3).
@@ -179,26 +187,25 @@ func (s *Scanner) evaluatePair(cfg Config, longIns, shortIns domain.CanonicalIns
 	cand.IntervalClass = strategy.ClassifyInterval(
 		longFundingInt, shortFundingInt,
 		longSnap.NextFundingTime, shortSnap.NextFundingTime,
-		true, // requireAligned — упрощение для v1; полная настройка в portfolio engine
-		5*time.Minute,
+		5*time.Minute, // MaxFundingTimeSkew — v1 constant; вынести в HotSettings при Этапе 9
 	)
 
-	// 5. Seconds to funding (минимум из двух ног).
-	longSecs := int64(time.Until(longSnap.NextFundingTime).Seconds())
-	shortSecs := int64(time.Until(shortSnap.NextFundingTime).Seconds())
+	// 5. Seconds to funding (минимум из двух ног). Явный now — никакого wall clock.
+	longSecs := int64(longSnap.NextFundingTime.Sub(now).Seconds())
+	shortSecs := int64(shortSnap.NextFundingTime.Sub(now).Seconds())
 	cand.SecondsToFunding = minInt64(longSecs, shortSecs)
 
 	// 6. ExpectedFundingPnL через funding calendar.
 	notional := cfg.TargetQty.Mul(longSnap.MarkPrice)
 	longEvents := strategy.BuildFundingCalendar(strategy.CalendarInput{
 		Exchange: longIns.Exchange, Symbol: longIns.ExchangeSymbol, Side: domain.SideLong,
-		PredictedRate: longSnap.PredictedFundingRate,
+		PredictedRate:   longSnap.PredictedFundingRate,
 		FundingInterval: longFundingInt, NextFundingTime: longSnap.NextFundingTime,
 		Horizon: cfg.Horizon, Confidence: longSnap.FundingConfidence, Notional: notional,
 	}, now)
 	shortEvents := strategy.BuildFundingCalendar(strategy.CalendarInput{
 		Exchange: shortIns.Exchange, Symbol: shortIns.ExchangeSymbol, Side: domain.SideShort,
-		PredictedRate: shortSnap.PredictedFundingRate,
+		PredictedRate:   shortSnap.PredictedFundingRate,
 		FundingInterval: shortFundingInt, NextFundingTime: shortSnap.NextFundingTime,
 		Horizon: cfg.Horizon, Confidence: shortSnap.FundingConfidence, Notional: notional,
 	}, now)
@@ -207,11 +214,9 @@ func (s *Scanner) evaluatePair(cfg Config, longIns, shortIns domain.CanonicalIns
 	// 7. ExpectedBasisPnL (упрощённо: entry basis × notional).
 	expectedBasisPnL := cand.EntryBasisVWAP.Mul(notional)
 
-	// 8. Fees.
-	feeCost := cfg.FeeRateBps.MulInt(10000).Mul(notional) // bps → fraction × notional
-	// На самом деле feeRateBps уже в bps, нужно notional × feeRate/10000.
-	// Исправлено ниже.
-	feeCost = notional.Mul(cfg.FeeRateBps).Div(decimal.MustFromString("10000")).MulInt(2) // entry+exit
+	// 8. Fees: bps → доля (÷10000), два taker-ордера на ногу × 2 ноги упрощены
+	// до entry+exit по суммарному notional (v1-оценка; точный расчёт в preflight).
+	feeCost := notional.Mul(cfg.FeeRateBps).Div(decimal.FromInt(10000)).MulInt(2)
 
 	// 9. ExpectedNetPnL.
 	bd := strategy.ExpectedNetPnL(strategy.PnLInput{
@@ -282,7 +287,7 @@ func (s *Scanner) calculateScores(cfg Config, longSnap, shortSnap *domain.Market
 		longSnap.AskDepthForTargetQty.Div(cfg.MinOrderBookDepthUSDT))
 	shortDepth := strategy.DepthRatioToLiquidityScore(
 		shortSnap.BidDepthForTargetQty.Div(cfg.MinOrderBookDepthUSDT))
-	liq := strategy.Score{longDepth.Value.Add(shortDepth.Value).Div(decimal.FromInt(2))}
+	liq := strategy.Score{Value: longDepth.Value.Add(shortDepth.Value).Div(decimal.FromInt(2))}
 
 	// FundingConfidence: минимальная из двух ног.
 	confScore := strategy.ConfidenceToScore(
@@ -291,7 +296,7 @@ func (s *Scanner) calculateScores(cfg Config, longSnap, shortSnap *domain.Market
 	// DataQuality.
 	dqLong := strategy.DataQualityFromFlags(longSnap.IsFresh, longSnap.SequenceValid)
 	dqShort := strategy.DataQualityFromFlags(shortSnap.IsFresh, shortSnap.SequenceValid)
-	dq := strategy.Score{dqLong.Value.Add(dqShort.Value).Div(decimal.FromInt(2))}
+	dq := strategy.Score{Value: dqLong.Value.Add(dqShort.Value).Div(decimal.FromInt(2))}
 
 	// ADL.
 	longADL := decimal.Zero
@@ -363,7 +368,7 @@ func EligibleCount(candidates []Candidate) int {
 	return n
 }
 
-// Top returns up to n eligible candidates sorted by composite score.
+// Top возвращает до n eligible кандидатов по убыванию composite score.
 func Top(candidates []Candidate, n int) []Candidate {
 	var eligible []Candidate
 	for _, c := range candidates {
@@ -371,7 +376,7 @@ func Top(candidates []Candidate, n int) []Candidate {
 			eligible = append(eligible, c)
 		}
 	}
-	sort.Slice(eligible, func(i, j int) bool {
+	sort.SliceStable(eligible, func(i, j int) bool {
 		return eligible[i].CompositeScore.GreaterThan(eligible[j].CompositeScore)
 	})
 	if len(eligible) > n {
@@ -379,6 +384,3 @@ func Top(candidates []Candidate, n int) []Candidate {
 	}
 	return eligible
 }
-
-// Suppress unused import for now — orderbook referenced indirectly.
-var _ = orderbook.CheckDepthSufficient

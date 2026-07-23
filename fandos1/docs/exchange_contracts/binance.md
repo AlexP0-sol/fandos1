@@ -98,9 +98,28 @@ API Key, API Secret. Passphrase НЕ требуется.
 - Funding payment приходит в `ACCOUNT_UPDATE` и в ledger; можно сверить через
   `/fapi/v1/income?incomeType=FUNDING_FEE`.
 
+## Withdrawal (вывод средств)
+
+**ВАЖНО: вывод НЕ доступен через fapi.**
+
+Binance Futures API (`fapi.binance.com`) не предоставляет endpoint для вывода средств.
+Вывод выполняется через Spot SAPI:
+
+- Base URL: `https://api.binance.com` (отдельный от fapi!)
+- Endpoint: `POST /sapi/v1/capital/withdraw/apply`
+- Аутентификация: тот же HMAC-SHA256 + `X-MBX-APIKEY` header, что и fapi, но ключ
+  должен иметь право `Withdraw` (обычно отдельный withdrawal-ключ).
+
+**Последствие для реализации:** адаптер ОБЯЗАН поддерживать два HTTP-клиента:
+1. `fapiClient` → `https://fapi.binance.com` — торговые операции.
+2. `sapiClient` → `https://api.binance.com` — только withdrawal (`/sapi/v1/capital/withdraw/apply`).
+
+Использование одного base URL для обоих приведёт к 404. Это архитектурное требование,
+а не деталь реализации.
+
 ## Известные ограничения / TODO для production
 - [ ] Сверить форматы JSON ответов с актуальной версией API.
 - [ ] Проверить ':' в newClientOrderId; при необходимости изменить Format() разделитель.
 - [ ] Уточнить funding interval per-symbol (1h/4h/8h) — брать из `exchangeInfo`.
 - [ ] IP whitelist: Binance требует IP-привязку через account settings.
-- [ ] Withdrawal через Futures API не доступен — нужен Spot API endpoint /sapi/v1/capital/withdraw/apply.
+- [ ] Убедиться, что withdrawal-ключ настроен с правом `Withdraw` и привязан к IP whitelist.

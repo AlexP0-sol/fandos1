@@ -26,13 +26,13 @@ type Score struct {
 
 // CandidateScores — набор всех scores кандидата.
 type CandidateScores struct {
-	LiquidityScore        Score
+	LiquidityScore         Score
 	FundingConfidenceScore Score
-	BasisStabilityScore   Score
-	ExecutionRiskScore    Score // выше = безопаснее (меньше риск исполнения)
-	CounterpartyRiskScore Score // выше = безопаснее контрагент
-	DataQualityScore      Score
-	ADLRiskScore          Score // выше = безопаснее (меньше ADL-риск)
+	BasisStabilityScore    Score
+	ExecutionRiskScore     Score // выше = безопаснее (меньше риск исполнения)
+	CounterpartyRiskScore  Score // выше = безопаснее контрагент
+	DataQualityScore       Score
+	ADLRiskScore           Score // выше = безопаснее (меньше ADL-риск)
 }
 
 // CompositeScore — взвешенная сумма всех scores (раздел 8.4).

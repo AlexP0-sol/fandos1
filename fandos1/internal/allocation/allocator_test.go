@@ -1,6 +1,7 @@
 package allocation
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/thecd/fundarbitrage/internal/decimal"
@@ -202,5 +203,69 @@ func TestFirstRejectReason(t *testing.T) {
 	reason, ok := FirstRejectReason(plan)
 	if !ok || reason == "" {
 		t.Error("expected reject reason")
+	}
+}
+
+// TestSameExchangeNoDoubleCount — когда long и short на одной бирже,
+// notional в exchange bucket добавляется только один раз.
+func TestSameExchangeNoDoubleCount(t *testing.T) {
+	// Binance cap = 5000. long=Binance, short=Binance.
+	// Desired notional = 10 × 100 = 1000. Должен пройти целиком — без двойного счёта.
+	limits := fullLimits()
+	limits.MaxExposurePerExchangeUSDT[domain.ExchangeBinance] = decimal.MustFromString("5000")
+
+	r := req("c1", "0.9", "10", "100", domain.ExchangeBinance, domain.ExchangeBinance, "BTC")
+	plan := Allocate([]CandidateRequest{r}, limits)
+	a := plan.Allocations[0]
+	if a.Rejected {
+		t.Errorf("same-exchange should not reject: %s", a.Reason)
+	}
+	if !a.AllocatedQty.Equal(decimal.MustFromString("10")) {
+		t.Errorf("qty = %s, want 10 (no double count)", a.AllocatedQty.String())
+	}
+	// После аллокации в exchange bucket должно быть 1000, а не 2000.
+	// Проверяем косвенно: следующий кандидат берёт оставшиеся 4000/100=40 qty.
+	r2 := req("c2", "0.8", "100", "100", domain.ExchangeBinance, domain.ExchangeBinance, "ETH")
+	plan2 := Allocate([]CandidateRequest{r, r2}, limits)
+	a2 := plan2.Allocations[1]
+	if a2.Rejected {
+		t.Errorf("c2 should not reject after same-exchange c1: %s", a2.Reason)
+	}
+	// c1 заняла 1000 → осталось 4000, c2 может взять 40 qty.
+	if !a2.AllocatedQty.Equal(decimal.MustFromString("40")) {
+		t.Errorf("c2 qty = %s, want 40 (4000 remaining after single-count c1)", a2.AllocatedQty.String())
+	}
+}
+
+// TestOverLimitExchangeRejectedWithName — биржа с нулевым/отрицательным доступным
+// бюджетом отклоняется с указанием имени биржи в причине.
+func TestOverLimitExchangeRejectedWithName(t *testing.T) {
+	limits := fullLimits()
+	// Полностью заполняем Binance.
+	limits.CurrentExposureUSDT[domain.ExchangeBinance] = limits.MaxExposurePerExchangeUSDT[domain.ExchangeBinance]
+
+	r := req("c1", "0.9", "10", "100", domain.ExchangeBinance, domain.ExchangeBybit, "BTC")
+	plan := Allocate([]CandidateRequest{r}, limits)
+	a := plan.Allocations[0]
+	if !a.Rejected {
+		t.Error("over-limit exchange should reject")
+	}
+	if !strings.Contains(a.Reason, string(domain.ExchangeBinance)) {
+		t.Errorf("reject reason %q should mention exchange name %q", a.Reason, domain.ExchangeBinance)
+	}
+}
+
+// TestEmptyRequests — пустой список запросов → пустой план, полный остаток бюджета.
+func TestEmptyRequests(t *testing.T) {
+	limits := fullLimits()
+	plan := Allocate(nil, limits)
+	if len(plan.Allocations) != 0 {
+		t.Errorf("allocations = %d, want 0", len(plan.Allocations))
+	}
+	if !plan.TotalAllocatedUSDT.IsZero() {
+		t.Errorf("total allocated = %s, want 0", plan.TotalAllocatedUSDT.String())
+	}
+	if !plan.RemainingBudgetUSDT.Equal(limits.TotalBudgetUSDT) {
+		t.Errorf("remaining = %s, want %s (full budget)", plan.RemainingBudgetUSDT.String(), limits.TotalBudgetUSDT.String())
 	}
 }

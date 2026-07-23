@@ -40,21 +40,43 @@ type ColdConfig struct {
 
 // LoadCold читает env с безопасными defaults и валидирует.
 // RunMode по умолчанию dry_run — live только явно (принцип safe defaults).
+// Если переменная окружения задана, но не разбирается — возвращает ошибку
+// (fail-fast при опечатках в конфиге).
 func LoadCold() (*ColdConfig, error) {
+	maxOpenConns, err := envInt("DB_MAX_OPEN_CONNS", 25)
+	if err != nil {
+		return nil, err
+	}
+	maxIdleConns, err := envInt("DB_MAX_IDLE_CONNS", 5)
+	if err != nil {
+		return nil, err
+	}
+	maxClockOffsetMs, err := envInt("MAX_CLOCK_OFFSET_MS", 500)
+	if err != nil {
+		return nil, err
+	}
+	clockSyncInterval, err := envDur("CLOCK_SYNC_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	shutdownTimeout, err := envDur("SHUTDOWN_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	c := &ColdConfig{
 		HTTPAddr:          envStr("HTTP_ADDR", ":8080"),
 		PublicBaseURL:     envStr("PUBLIC_BASE_URL", ""),
 		DBDSN:             envStr("DATABASE_URL", ""),
-		DBMaxOpenConns:    envInt("DB_MAX_OPEN_CONNS", 25),
-		DBMaxIdleConns:    envInt("DB_MAX_IDLE_CONNS", 5),
+		DBMaxOpenConns:    maxOpenConns,
+		DBMaxIdleConns:    maxIdleConns,
 		MasterKeyEnv:      envStr("MASTER_KEY_ENV", "MASTER_KEY"),
 		KMSProvider:       envStr("KMS_PROVIDER", "env"),
 		NTPServers:        strings.Split(envStr("NTP_SERVERS", "pool.ntp.org"), ","),
-		MaxClockOffsetMs:  int64(envInt("MAX_CLOCK_OFFSET_MS", 500)),
-		ClockSyncInterval: envDur("CLOCK_SYNC_INTERVAL", 30*time.Second),
+		MaxClockOffsetMs:  int64(maxClockOffsetMs),
+		ClockSyncInterval: clockSyncInterval,
 		PrometheusAddr:    envStr("PROM_ADDR", ":9090"),
 		OTLPEndpoint:      envStr("OTLP_ENDPOINT", ""),
-		ShutdownTimeout:   envDur("SHUTDOWN_TIMEOUT", 30*time.Second),
+		ShutdownTimeout:   shutdownTimeout,
 		LogLevel:          envStr("LOG_LEVEL", "info"),
 		RunMode:           domain.RunMode(envStr("RUN_MODE", string(domain.RunModeDryRun))),
 	}
@@ -76,6 +98,17 @@ func (c *ColdConfig) validate() error {
 	if c.KMSProvider != "env" && c.KMSProvider != "aws" && c.KMSProvider != "gcp" {
 		return fmt.Errorf("config: неизвестный KMS_PROVIDER %q", c.KMSProvider)
 	}
+	// Ограничения пула соединений: idle не должен превышать open.
+	if c.DBMaxIdleConns > c.DBMaxOpenConns {
+		return fmt.Errorf("config: DB_MAX_IDLE_CONNS (%d) > DB_MAX_OPEN_CONNS (%d)", c.DBMaxIdleConns, c.DBMaxOpenConns)
+	}
+	// ShutdownTimeout и ClockSyncInterval должны быть положительными.
+	if c.ShutdownTimeout <= 0 {
+		return fmt.Errorf("config: SHUTDOWN_TIMEOUT должен быть > 0")
+	}
+	if c.ClockSyncInterval <= 0 {
+		return fmt.Errorf("config: CLOCK_SYNC_INTERVAL должен быть > 0")
+	}
 	return nil
 }
 
@@ -85,21 +118,33 @@ func envStr(k, d string) string {
 	}
 	return d
 }
-func envInt(k string, d int) int {
-	if v, ok := os.LookupEnv(k); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+
+// envInt читает целочисленную переменную окружения.
+// Если переменная задана, но не является числом — возвращает ошибку (fail-fast).
+func envInt(k string, d int) (int, error) {
+	v, ok := os.LookupEnv(k)
+	if !ok {
+		return d, nil
 	}
-	return d
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q: %w", k, v, err)
+	}
+	return n, nil
 }
-func envDur(k string, d time.Duration) time.Duration {
-	if v, ok := os.LookupEnv(k); ok {
-		if p, err := time.ParseDuration(v); err == nil {
-			return p
-		}
+
+// envDur читает duration-переменную окружения.
+// Если переменная задана, но не разбирается — возвращает ошибку (fail-fast).
+func envDur(k string, d time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(k)
+	if !ok {
+		return d, nil
 	}
-	return d
+	p, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q: %w", k, v, err)
+	}
+	return p, nil
 }
 
 // ============================================================
@@ -125,6 +170,7 @@ type HotSettings struct {
 	MarginMode                 domain.MarginMode
 	PositionMode               domain.PositionMode
 	MaxDailyLossUSDT           dec.Decimal
+	MaxPositionLossUSDT        dec.Decimal
 	RiskSnapAfterMaxDailyLoss  bool
 	JointSlippageCapBps        dec.Decimal
 	MaxExposurePerExchangeUSDT map[domain.ExchangeID]dec.Decimal
@@ -187,6 +233,25 @@ func (h *HotSettings) Validate() ([]Warning, error) {
 	if h.AckTimeoutBehavior != "QUERY_THEN_DECIDE" {
 		return nil, fmt.Errorf("hot settings: единственный допустимый AckTimeoutBehavior в v1 — QUERY_THEN_DECIDE")
 	}
+	// Leverage должен быть строго положительным.
+	if !h.Leverage.IsPositive() {
+		return nil, fmt.Errorf("hot settings: Leverage должен быть > 0, получено %s", h.Leverage)
+	}
+	// Дневной лимит убытка и лимит убытка позиции не могут быть отрицательными.
+	if h.MaxDailyLossUSDT.IsNegative() {
+		return nil, fmt.Errorf("hot settings: MaxDailyLossUSDT не может быть отрицательным")
+	}
+	if h.MaxPositionLossUSDT.IsNegative() {
+		return nil, fmt.Errorf("hot settings: MaxPositionLossUSDT не может быть отрицательным")
+	}
+	// MarginMode должен быть одним из допустимых значений домена.
+	if h.MarginMode != domain.MarginIsolated && h.MarginMode != domain.MarginCross {
+		return nil, fmt.Errorf("hot settings: неизвестный MarginMode %q", h.MarginMode)
+	}
+	// PositionMode должен быть одним из допустимых значений домена.
+	if h.PositionMode != domain.PositionOneWay && h.PositionMode != domain.PositionHedge {
+		return nil, fmt.Errorf("hot settings: неизвестный PositionMode %q", h.PositionMode)
+	}
 	if h.OrderMode == domain.OrderMarket {
 		warns = append(warns, Warning{"MARKET_MODE", "MARKET-режим: неконтролируемый slippage"})
 	}
@@ -201,6 +266,10 @@ func (h *HotSettings) Validate() ([]Warning, error) {
 	}
 	if h.MaxDailyLossUSDT.IsZero() {
 		warns = append(warns, Warning{"NO_DAILY_STOP", "не задан дневной стоп-лимит"})
+	}
+	// Предупреждение при высоком плече.
+	if h.Leverage.GreaterThan(dec.MustFromString("20")) {
+		warns = append(warns, Warning{"HIGH_LEVERAGE", fmt.Sprintf("высокое плечо %s: повышенный риск ликвидации", h.Leverage)})
 	}
 	return warns, nil
 }

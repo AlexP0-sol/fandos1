@@ -10,16 +10,16 @@ import (
 // TestExpectedNetPnLPositive — все доходы больше расходов → положительный net.
 func TestExpectedNetPnLPositive(t *testing.T) {
 	in := PnLInput{
-		ExpectedFundingPnL:         decimal.MustFromString("10"),
-		ExpectedBasisPnL:           decimal.MustFromString("5"),
-		EstimatedEntryFees:         decimal.MustFromString("1"),
-		EstimatedExitFees:          decimal.MustFromString("1"),
-		EstimatedEntrySlippage:     decimal.MustFromString("0.5"),
-		EstimatedExitSlippage:      decimal.MustFromString("0.5"),
-		FundingUncertaintyReserve:  decimal.MustFromString("2"),
-		BasisDivergenceReserve:     decimal.MustFromString("1"),
-		CounterpartyRiskReserve:    decimal.MustFromString("1.5"),
-		SafetyReserve:              decimal.MustFromString("2"),
+		ExpectedFundingPnL:        decimal.MustFromString("10"),
+		ExpectedBasisPnL:          decimal.MustFromString("5"),
+		EstimatedEntryFees:        decimal.MustFromString("1"),
+		EstimatedExitFees:         decimal.MustFromString("1"),
+		EstimatedEntrySlippage:    decimal.MustFromString("0.5"),
+		EstimatedExitSlippage:     decimal.MustFromString("0.5"),
+		FundingUncertaintyReserve: decimal.MustFromString("2"),
+		BasisDivergenceReserve:    decimal.MustFromString("1"),
+		CounterpartyRiskReserve:   decimal.MustFromString("1.5"),
+		SafetyReserve:             decimal.MustFromString("2"),
 	}
 	// gross = 15, deductions = 1+1+0.5+0.5+2+1+1.5+2 = 9.5, net = 5.5
 	bd := ExpectedNetPnL(in)
@@ -32,9 +32,9 @@ func TestExpectedNetPnLPositive(t *testing.T) {
 // TestExpectedNetPnLNegative — расходы превышают доходы → отрицательный net.
 func TestExpectedNetPnLNegative(t *testing.T) {
 	in := PnLInput{
-		ExpectedFundingPnL:      decimal.MustFromString("1"),
-		EstimatedEntryFees:       decimal.MustFromString("3"),
-		EstimatedExitFees:        decimal.MustFromString("3"),
+		ExpectedFundingPnL: decimal.MustFromString("1"),
+		EstimatedEntryFees: decimal.MustFromString("3"),
+		EstimatedExitFees:  decimal.MustFromString("3"),
 	}
 	bd := ExpectedNetPnL(in)
 	if !bd.Net.IsNegative() {
@@ -83,12 +83,12 @@ func TestExpectedNetPnLRebalanceReserve(t *testing.T) {
 // TestCheckEligibilityPass — все фильтры пройдены.
 func TestCheckEligibilityPass(t *testing.T) {
 	res := CheckEligibility(
-		decimal.MustFromString("5"),  // net
-		decimal.MustFromString("1"),  // min
-		domain.ConfidenceHigh,        // confidence
-		domain.ConfidenceMedium,      // minConfidence
-		60,                           // secondsBeforeFunding
-		30,                           // minSeconds
+		decimal.MustFromString("5"), // net
+		decimal.MustFromString("1"), // min
+		domain.ConfidenceHigh,       // confidence
+		domain.ConfidenceMedium,     // minConfidence
+		60,                          // secondsBeforeFunding
+		30,                          // minSeconds
 	)
 	if !res.Eligible {
 		t.Errorf("expected eligible, reason=%s", res.Reason)
@@ -100,7 +100,7 @@ func TestCheckEligibilityConfidenceTooLow(t *testing.T) {
 	res := CheckEligibility(
 		decimal.MustFromString("100"),
 		decimal.MustFromString("1"),
-		domain.ConfidenceLow,    // ниже требуемого
+		domain.ConfidenceLow, // ниже требуемого
 		domain.ConfidenceMedium,
 		60, 30,
 	)
@@ -116,8 +116,8 @@ func TestCheckEligibilityTooCloseToFunding(t *testing.T) {
 		decimal.MustFromString("1"),
 		domain.ConfidenceHigh,
 		domain.ConfidenceMedium,
-		10,  // осталось 10 сек
-		30,  // минимум 30
+		10, // осталось 10 сек
+		30, // минимум 30
 	)
 	if res.Eligible {
 		t.Error("too close to funding should be rejected")
@@ -141,10 +141,10 @@ func TestCheckEligibilityPnLTooLow(t *testing.T) {
 // TestExpectedNetPnLExactBreakdownSum — сумма компонентов = net (consistency check).
 func TestExpectedNetPnLExactBreakdownSum(t *testing.T) {
 	in := PnLInput{
-		ExpectedFundingPnL:      decimal.MustFromString("10"),
-		ExpectedBasisPnL:        decimal.MustFromString("3"),
-		EstimatedEntryFees:      decimal.MustFromString("1"),
-		SafetyReserve:           decimal.MustFromString("2"),
+		ExpectedFundingPnL: decimal.MustFromString("10"),
+		ExpectedBasisPnL:   decimal.MustFromString("3"),
+		EstimatedEntryFees: decimal.MustFromString("1"),
+		SafetyReserve:      decimal.MustFromString("2"),
 	}
 	bd := ExpectedNetPnL(in)
 	var sum decimal.Decimal

@@ -16,6 +16,19 @@ func newRand() *rand.Rand {
 	return rand.New(rand.NewSource(42))
 }
 
+// waitFor — опрашивает cond каждые 5ms до таймаута.
+// Возвращает true, если cond вернул true до истечения timeout.
+func waitFor(cond func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
 // TestBackoffGrowth — задержки растут экспоненциально до потолка.
 func TestBackoffGrowth(t *testing.T) {
 	b := BackoffConfig{Initial: 100 * time.Millisecond, Max: time.Second, Multiplier: 2.0, Jitter: 0}
@@ -48,6 +61,19 @@ func TestBackoffJitterWithinBounds(t *testing.T) {
 	}
 }
 
+// TestBackoffNoInfOverflow — большой attempt не вызывает overflow к +Inf.
+func TestBackoffNoInfOverflow(t *testing.T) {
+	b := BackoffConfig{Initial: time.Second, Max: 60 * time.Second, Multiplier: 2.0, Jitter: 0}
+	// 1000 попыток — без паники/Inf
+	got := b.NextDelay(1000, nil)
+	if got > b.Max {
+		t.Errorf("delay %v exceeds Max %v", got, b.Max)
+	}
+	if got <= 0 {
+		t.Errorf("delay %v must be positive", got)
+	}
+}
+
 // TestManagerFirstConnectSuccess — первичный успех сбрасывает счётчик.
 func TestManagerFirstConnectSuccess(t *testing.T) {
 	var calls atomic.Int64
@@ -61,15 +87,17 @@ func TestManagerFirstConnectSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go m.Run(ctx)
-	// Даём первый connect.
-	time.Sleep(50 * time.Millisecond)
+
+	// Ждём первого вызова через polling.
+	if !waitFor(func() bool { return calls.Load() >= 1 }, 500*time.Millisecond) {
+		t.Fatal("timeout waiting for first connect call")
+	}
 	cancel()
-	time.Sleep(20 * time.Millisecond)
 
 	if calls.Load() != 1 {
 		t.Errorf("expected 1 connect call, got %d", calls.Load())
 	}
-	if m.ReconnectCount() != 1 {
+	if !waitFor(func() bool { return m.ReconnectCount() >= 1 }, 200*time.Millisecond) {
 		t.Errorf("reconnect count=%d, want 1", m.ReconnectCount())
 	}
 }
@@ -130,10 +158,15 @@ func TestManagerStop(t *testing.T) {
 	}
 	m := NewConnectionManager(domain.ExchangeBinance, cb)
 	go m.Run(context.Background())
-	time.Sleep(30 * time.Millisecond)
+
+	// Ждём первого соединения через polling.
+	if !waitFor(func() bool { return m.ReconnectCount() >= 1 }, 500*time.Millisecond) {
+		t.Fatal("timeout waiting for first connect")
+	}
 	m.Stop()
 	// После Stop — manager не должен паниковать или висеть.
-	time.Sleep(30 * time.Millisecond)
+	// Даём короткий slot на завершение (не sleep).
+	time.Sleep(20 * time.Millisecond)
 }
 
 // TestManagerReconnectsAfterDrop — обрыв успешного соединения → reconnect.
@@ -155,11 +188,70 @@ func TestManagerReconnectsAfterDrop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go m.Run(ctx)
-	time.Sleep(80 * time.Millisecond)
-	cancel()
-	time.Sleep(20 * time.Millisecond)
 
-	if calls.Load() < 2 {
+	// Ждём второго вызова через polling вместо фиксированного sleep.
+	if !waitFor(func() bool { return calls.Load() >= 2 }, 500*time.Millisecond) {
 		t.Errorf("expected at least 2 connections (drop + reconnect), got %d", calls.Load())
 	}
+	cancel()
+}
+
+// TestManagerDoubleStartError — второй вызов Run() возвращает ErrAlreadyRunning.
+func TestManagerDoubleStartError(t *testing.T) {
+	cb := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	m := NewConnectionManager(domain.ExchangeBinance, cb)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go m.Run(ctx)
+
+	// Ждём, пока Run стартует.
+	if !waitFor(func() bool { return m.ReconnectCount() >= 1 }, 500*time.Millisecond) {
+		t.Fatal("timeout waiting for Run to start")
+	}
+
+	// Второй вызов Run должен вернуть ErrAlreadyRunning.
+	err := m.Run(ctx)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("second Run: got %v, want ErrAlreadyRunning", err)
+	}
+}
+
+// TestManagerCircuitBreakerResetsAttemptsOnReopen — при Open→Closed сбрасываются попытки,
+// чтобы probe-попытка не вызвала немедленное повторное размыкание.
+func TestManagerCircuitBreakerResetsAttemptsOnReopen(t *testing.T) {
+	var calls atomic.Int64
+	threshold := 3
+	// Первые threshold попыток завершаются неудачей (открывают breaker).
+	// После Reset — probe должна успеть.
+	cb := func(ctx context.Context) error {
+		n := calls.Add(1)
+		if n <= int64(threshold) {
+			return errors.New("fail")
+		}
+		// probe-попытка и все последующие успешны.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	resetTimeout := 20 * time.Millisecond
+	m := NewConnectionManager(domain.ExchangeBinance, cb).
+		WithBackoff(BackoffConfig{Initial: 1 * time.Millisecond, Max: 2 * time.Millisecond, Multiplier: 2, Jitter: 0}).
+		WithBreaker(CircuitBreakerConfig{FailureThreshold: threshold, ResetTimeout: resetTimeout})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go m.Run(ctx)
+
+	// Ждём, пока probe-попытка не пройдёт (calls > threshold).
+	if !waitFor(func() bool { return calls.Load() > int64(threshold) }, 500*time.Millisecond) {
+		t.Errorf("probe attempt did not occur, calls=%d", calls.Load())
+	}
+	// Breaker должен быть закрыт (probe успешна).
+	if m.State() != BreakerClosed {
+		t.Errorf("breaker should be closed after successful probe, got %d", m.State())
+	}
+	cancel()
 }

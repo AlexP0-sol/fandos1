@@ -10,10 +10,10 @@ import (
 
 func mkSnap(ex domain.ExchangeID, asset string, ts time.Time) *domain.MarketSnapshot {
 	return &domain.MarketSnapshot{
-		Exchange:         ex,
+		Exchange:           ex,
 		CanonicalBaseAsset: domain.AssetSymbol(asset),
-		LocalReceiveTime: ts,
-		IsFresh:          true,
+		LocalReceiveTime:   ts,
+		IsFresh:            true,
 	}
 }
 
@@ -127,8 +127,13 @@ func TestGlobalStats(t *testing.T) {
 	if g.TotalUpdates != 6 {
 		t.Errorf("updates=%d, want 6", g.TotalUpdates)
 	}
-	if g.TotalDrops != 3 {
-		t.Errorf("drops=%d, want 3 (по одному на каждый 2-й update)", g.TotalDrops)
+	// TotalReplaced — новое имя (перезаписи).
+	if g.TotalReplaced != 3 {
+		t.Errorf("replaced=%d, want 3 (по одному на каждый 2-й update)", g.TotalReplaced)
+	}
+	// TotalDrops — устаревший псевдоним, равен TotalReplaced.
+	if g.TotalDrops != g.TotalReplaced {
+		t.Errorf("TotalDrops(%d) != TotalReplaced(%d): псевдоним сломан", g.TotalDrops, g.TotalReplaced)
 	}
 	if g.TrackedSymbols != 3 {
 		t.Errorf("tracked=%d, want 3", g.TrackedSymbols)

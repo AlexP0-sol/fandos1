@@ -4,34 +4,95 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestTelegramOfficialVector — официальный test vector из документации Telegram.
-// https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+// testBotToken — синтаксически валидный токен для тестов (не реальный).
+const testBotToken = "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
+
+// signInitData — эталонная реализация канонического алгоритма Telegram:
+// data_check_string из ДЕКОДИРОВАННЫХ значений, отсортированных по ключу.
+// Используется тестами для генерации валидных initData.
+func signInitData(botToken string, decoded map[string]string) string {
+	keys := make([]string, 0, len(decoded))
+	for k := range decoded {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var dcs strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			dcs.WriteByte('\n')
+		}
+		dcs.WriteString(k)
+		dcs.WriteByte('=')
+		dcs.WriteString(decoded[k])
+	}
+	secret := hmac.New(sha256.New, []byte("WebAppData"))
+	secret.Write([]byte(botToken))
+	h := hmac.New(sha256.New, secret.Sum(nil))
+	h.Write([]byte(dcs.String()))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// buildInitData — собирает URL-encoded initData из декодированных пар + hash.
+func buildInitData(decoded map[string]string, hash string) string {
+	keys := make([]string, 0, len(decoded))
+	for k := range decoded {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape(k))
+		b.WriteByte('=')
+		b.WriteString(url.QueryEscape(decoded[k]))
+	}
+	b.WriteString("&hash=")
+	b.WriteString(hash)
+	return b.String()
+}
+
+// userJSON — типичное значение поля user.
+const userJSON = `{"id":279058397,"first_name":"dev","last_name":"","username":"devuser","language_code":"en"}`
+
+func validPairs() map[string]string {
+	return map[string]string{
+		"query_id":  "AAHdF6IQAAAAAN0XohDhrOrc",
+		"user":      userJSON,
+		"auth_date": "1696588919",
+	}
+}
+
+// TestKnownAnswerVector — контрольный вектор, вычисленный НЕЗАВИСИМОЙ реализацией
+// (Python hmac/hashlib по официальному алгоритму Telegram). Защищает от случая,
+// когда реализация и тестовый helper дрейфуют синхронно.
 //
-// bot_token = "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
-// (это публичный test vector из документации, не реальный токен).
-func TestTelegramOfficialVector(t *testing.T) {
-	const botToken = "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
+// data_check_string:
+//
+//	auth_date=1696588919
+//	query_id=AAHdF6IQAAAAAN0XohDhrOrc
+//	user={"id":279058397,"first_name":"dev","last_name":"","username":"devuser","language_code":"en"}
+func TestKnownAnswerVector(t *testing.T) {
+	const wantHash = "d4e1fc2fe2a0f5c4deae20579013af4eabec6190e2893c2b118f06dd1c67ebe7"
 
-	// Официальный initData из документации (строка немного длинная).
-	// auth_date = 1696588919, botToken = "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
-	// hash from docs: 0d623aa3f2670e88e3f6d23e44d3a0d536e0c92f5f63a6e8821b67e63a5f0b25
-	initData := "query_id=AAHdF6IQAAAAAN0XohDhrOrc" +
-		"&user=%7B%22id%22%3A279058397%2C%22first_name%22%3A%22dev%22%2C%22last_name%22%3A%22%22%2C%22username%22%3A%22devuser%22%2C%22language_code%22%3A%22en%22%7D" +
-		"&auth_date=1696588919" +
-		"&hash=0d623aa3f2670e88e3f6d23e44d3a0d536e0c92f5f63a6e8821b67e63a5f0b25"
+	// Helper обязан выдать тот же hash, что и независимая реализация.
+	if got := signInitData(testBotToken, validPairs()); got != wantHash {
+		t.Fatalf("test helper drifted from canonical algorithm:\n got %s\nwant %s", got, wantHash)
+	}
 
-	cfg := ValidateConfig{BotToken: botToken, MaxAge: 0} // не проверяем возраст для тест-вектора
-	allowlist := StaticAllowlist{279058397: true}
-
-	res := ValidateInitData(initData, cfg, allowlist)
+	initData := buildInitData(validPairs(), wantHash)
+	res := ValidateInitData(initData, ValidateConfig{BotToken: testBotToken}, StaticAllowlist{279058397: true})
 	if !res.Valid {
-		t.Fatalf("official vector failed: %s", res.Reason)
+		t.Fatalf("known-answer vector rejected: %s", res.Reason)
 	}
 	if res.User.ID != 279058397 {
 		t.Errorf("user ID = %d, want 279058397", res.User.ID)
@@ -45,14 +106,15 @@ func TestTelegramOfficialVector(t *testing.T) {
 	if res.User.LanguageCode != "en" {
 		t.Errorf("language_code = %q, want en", res.User.LanguageCode)
 	}
+	if got := res.AuthAt.Unix(); got != 1696588919 {
+		t.Errorf("AuthAt = %d, want 1696588919", got)
+	}
 }
 
-// TestHashMismatch — подделанный initData отклоняется.
+// TestHashMismatch — подделанный hash отклоняется.
 func TestHashMismatch(t *testing.T) {
-	// Подменим hash на случайный.
-	initData := "query_id=AAA&user=%7B%22id%22%3A1%7D&auth_date=1696588919&hash=0000000000000000000000000000000000000000000000000000000000000000"
-	cfg := ValidateConfig{BotToken: "any", MaxAge: 0}
-	res := ValidateInitData(initData, cfg, StaticAllowlist{1: true})
+	initData := buildInitData(validPairs(), strings.Repeat("0", 64))
+	res := ValidateInitData(initData, ValidateConfig{BotToken: testBotToken}, StaticAllowlist{279058397: true})
 	if res.Valid {
 		t.Error("fake hash should be rejected")
 	}
@@ -61,58 +123,41 @@ func TestHashMismatch(t *testing.T) {
 	}
 }
 
-// TestMissingHash
-func TestMissingHash(t *testing.T) {
-	res := ValidateInitData("user=%7B%22id%22%3A1%7D&auth_date=1696588919", ValidateConfig{BotToken: "k"}, nil)
+// TestTamperedField — валидная подпись + изменённое поле отклоняется.
+func TestTamperedField(t *testing.T) {
+	pairs := validPairs()
+	hash := signInitData(testBotToken, pairs)
+	// Подменяем user после подписания.
+	pairs["user"] = `{"id":1,"first_name":"evil"}`
+	res := ValidateInitData(buildInitData(pairs, hash), ValidateConfig{BotToken: testBotToken}, nil)
 	if res.Valid {
-		t.Error("missing hash should be rejected")
+		t.Error("tampered user field must be rejected")
 	}
 }
 
-// TestEmptyInitData
-func TestEmptyInitData(t *testing.T) {
-	res := ValidateInitData("", ValidateConfig{BotToken: "k"}, nil)
+// TestWrongBotToken — подпись другим токеном отклоняется.
+func TestWrongBotToken(t *testing.T) {
+	hash := signInitData("1:other-token", validPairs())
+	res := ValidateInitData(buildInitData(validPairs(), hash), ValidateConfig{BotToken: testBotToken}, nil)
 	if res.Valid {
-		t.Error("empty initData should be rejected")
+		t.Error("initData signed with another bot token must be rejected")
 	}
 }
 
-// TestMalformedQuery
-func TestMalformedQuery(t *testing.T) {
-	res := ValidateInitData("not%%a=valid=query", ValidateConfig{BotToken: "k"}, nil)
-	if res.Valid {
-		t.Error("malformed query should be rejected")
-	}
-}
-
-// TestMissingAuthDate
-func TestMissingAuthDate(t *testing.T) {
-	res := ValidateInitData("user=%7B%22id%22%3A1%7D&hash=abc", ValidateConfig{BotToken: "k"}, nil)
-	if res.Valid {
-		t.Error("missing auth_date should be rejected")
-	}
-}
-
-// TestExpiredInitData — устаревший auth_date отклоняется.
-func TestExpiredInitData(t *testing.T) {
-	botToken := "12345:test"
-	// Строим валидную подпись для старого auth_date.
+// TestExpired — устаревший auth_date отклоняется при MaxAge > 0.
+func TestExpired(t *testing.T) {
 	authDate := int64(1000000000) // 2001 год.
-	values := "auth_date=" + itoa(authDate) + "&user=%7B%22id%22%3A1%7D"
-	// data_check_string = "auth_date=1000000000\nuser=%7B%22id%22%3A1%7D"
-	dataCheck := "auth_date=" + itoa(authDate) + "\nuser=%7B%22id%22%3A1%7D"
-	secret := hmac.New(sha256.New, []byte("WebAppData"))
-	secret.Write([]byte(botToken))
-	secretBytes := secret.Sum(nil)
-	hasher := hmac.New(sha256.New, secretBytes)
-	hasher.Write([]byte(dataCheck))
-	sig := hex.EncodeToString(hasher.Sum(nil))
-	initData := values + "&hash=" + sig
+	pairs := validPairs()
+	pairs["auth_date"] = strconv.FormatInt(authDate, 10)
+	hash := signInitData(testBotToken, pairs)
 
-	// MaxAge = 1 минута, auth_date — далеко в прошлом.
-	fixedNow := time.Unix(authDate+1000000, 0)
-	cfg := ValidateConfig{BotToken: botToken, MaxAge: time.Minute, Now: func() time.Time { return fixedNow }}
-	res := ValidateInitData(initData, cfg, nil)
+	fixedNow := time.Unix(authDate+1_000_000, 0)
+	cfg := ValidateConfig{
+		BotToken: testBotToken,
+		MaxAge:   time.Minute,
+		Now:      func() time.Time { return fixedNow },
+	}
+	res := ValidateInitData(buildInitData(pairs, hash), cfg, nil)
 	if res.Valid {
 		t.Error("expired initData should be rejected")
 	}
@@ -121,64 +166,103 @@ func TestExpiredInitData(t *testing.T) {
 	}
 }
 
-// TestAllowlistBlocksNonAdmin — даже валидная подпись отклоняет не-admin.
-func TestAllowlistBlocksNonAdmin(t *testing.T) {
-	botToken := "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
-	initData := "query_id=AAHdF6IQAAAAAN0XohDhrOrc" +
-		"&user=%7B%22id%22%3A279058397%2C%22first_name%22%3A%22dev%22%2C%22last_name%22%3A%22%22%2C%22username%22%3A%22devuser%22%2C%22language_code%22%3A%22en%22%7D" +
-		"&auth_date=1696588919" +
-		"&hash=0d623aa3f2670e88e3f6d23e44d3a0d536e0c92f5f63a6e8821b67e63a5f0b25"
+// TestFutureAuthDate — auth_date из будущего отклоняется при MaxAge > 0.
+func TestFutureAuthDate(t *testing.T) {
+	authDate := int64(2_000_000_000)
+	pairs := validPairs()
+	pairs["auth_date"] = strconv.FormatInt(authDate, 10)
+	hash := signInitData(testBotToken, pairs)
 
-	// Allowlist пустой — пользователь не админ.
-	res := ValidateInitData(initData, ValidateConfig{BotToken: botToken}, StaticAllowlist{})
+	fixedNow := time.Unix(authDate-3600, 0) // «сейчас» на час раньше auth_date
+	cfg := ValidateConfig{
+		BotToken: testBotToken,
+		MaxAge:   24 * time.Hour,
+		Now:      func() time.Time { return fixedNow },
+	}
+	res := ValidateInitData(buildInitData(pairs, hash), cfg, nil)
+	if res.Valid {
+		t.Error("future auth_date should be rejected")
+	}
+}
+
+// TestAllowlistBlocksNonAdmin — валидная подпись, но пользователь не в allowlist.
+func TestAllowlistBlocksNonAdmin(t *testing.T) {
+	hash := signInitData(testBotToken, validPairs())
+	res := ValidateInitData(buildInitData(validPairs(), hash),
+		ValidateConfig{BotToken: testBotToken}, StaticAllowlist{})
 	if res.Valid {
 		t.Error("non-admin should be rejected by allowlist")
 	}
 	if !strings.Contains(res.Reason, "allowlist") {
-		t.Errorf("reason = %q", res.Reason)
+		t.Errorf("reason = %q, want allowlist-related", res.Reason)
 	}
 }
 
-// TestNilAllowlistBypasses — nil allowlist = не проверяется (только для testing/dev).
+// TestNilAllowlistBypasses — nil allowlist = проверка отключена (только dev/tests).
 func TestNilAllowlistBypasses(t *testing.T) {
-	botToken := "5768337691:AAH5YkoiWVoyDnuT8P5jznJuUeK5MEZK8_4"
-	initData := "query_id=AAHdF6IQAAAAAN0XohDhrOrc" +
-		"&user=%7B%22id%22%3A279058397%2C%22first_name%22%3A%22dev%22%7D" +
-		"&auth_date=1696588919" +
-		"&hash=3983c4a7f0f8b23e3e5e8b53f3c93e0f5c66e875d4b0d6f6a8e5b7e1c3b9b1a4"
+	hash := signInitData(testBotToken, validPairs())
+	res := ValidateInitData(buildInitData(validPairs(), hash),
+		ValidateConfig{BotToken: testBotToken}, nil)
+	if !res.Valid {
+		t.Errorf("nil allowlist should bypass admin check, got reason %q", res.Reason)
+	}
+}
 
-	// Несоответствующий hash → всё равно отклонится на hash-проверке.
-	res := ValidateInitData(initData, ValidateConfig{BotToken: botToken}, nil)
+// TestUserJSONParsing — полный набор полей WebAppUser через encoding/json,
+// включая экранированные кавычки, которые ломали старый ручной парсер.
+func TestUserJSONParsing(t *testing.T) {
+	pairs := validPairs()
+	pairs["user"] = `{"id":12345,"first_name":"Alice \"Al\"","last_name":"Smith","username":"alice",` +
+		`"language_code":"ru","is_premium":true,"allows_write_to_pm":true,"photo_url":"https://t.me/i/userpic/x.jpg"}`
+	hash := signInitData(testBotToken, pairs)
+	res := ValidateInitData(buildInitData(pairs, hash), ValidateConfig{BotToken: testBotToken}, nil)
+	if !res.Valid {
+		t.Fatalf("valid initData rejected: %s", res.Reason)
+	}
+	u := res.User
+	if u.ID != 12345 || u.FirstName != `Alice "Al"` || u.LastName != "Smith" ||
+		u.Username != "alice" || u.LanguageCode != "ru" || !u.IsPremium || !u.AllowsWriteToPM ||
+		u.PhotoURL != "https://t.me/i/userpic/x.jpg" {
+		t.Errorf("user fields parsed incorrectly: %+v", u)
+	}
+}
+
+// TestMalformedInputs — граничные случаи не должны паниковать и должны отклоняться.
+func TestMalformedInputs(t *testing.T) {
+	cases := map[string]string{
+		"empty":           "",
+		"no hash":         "auth_date=1&user=%7B%22id%22%3A1%7D",
+		"no auth_date":    "user=%7B%22id%22%3A1%7D&hash=" + strings.Repeat("a", 64),
+		"bad percent enc": "user=%ZZ&auth_date=1&hash=" + strings.Repeat("a", 64),
+		"garbage":         "&&&===&&&",
+		"hash only":       "hash=" + strings.Repeat("a", 64),
+	}
+	for name, initData := range cases {
+		if res := ValidateInitData(initData, ValidateConfig{BotToken: testBotToken}, nil); res.Valid {
+			t.Errorf("%s: malformed initData accepted", name)
+		}
+	}
+	// Пустой токен бота.
+	if res := ValidateInitData("auth_date=1&hash=aa", ValidateConfig{}, nil); res.Valid {
+		t.Error("empty bot token accepted")
+	}
+}
+
+// TestMissingUser — initData без user отклоняется (user ID нужен для allowlist).
+func TestMissingUser(t *testing.T) {
+	pairs := map[string]string{"auth_date": "1696588919", "query_id": "AAA"}
+	hash := signInitData(testBotToken, pairs)
+	res := ValidateInitData(buildInitData(pairs, hash), ValidateConfig{BotToken: testBotToken}, nil)
 	if res.Valid {
-		t.Error("hash mismatch should reject regardless of allowlist")
+		t.Error("initData without user must be rejected")
 	}
 }
 
-// TestParseTelegramUser — извлечение полей пользователя.
-func TestParseTelegramUser(t *testing.T) {
-	jsonStr := `{"id":12345,"first_name":"Alice","last_name":"Smith","username":"alice","language_code":"ru","is_premium":true,"allows_write_to_pm":true}`
-	u := parseTelegramUser(jsonStr)
-	if u.ID != 12345 {
-		t.Errorf("id = %d, want 12345", u.ID)
+// TestUppercaseHash — hash в верхнем регистре принимается (нормализация регистра).
+func TestUppercaseHash(t *testing.T) {
+	hash := strings.ToUpper(signInitData(testBotToken, validPairs()))
+	res := ValidateInitData(buildInitData(validPairs(), hash), ValidateConfig{BotToken: testBotToken}, nil)
+	if !res.Valid {
+		t.Errorf("uppercase hash rejected: %s", res.Reason)
 	}
-	if u.FirstName != "Alice" {
-		t.Errorf("first_name = %q", u.FirstName)
-	}
-	if u.LastName != "Smith" {
-		t.Errorf("last_name = %q", u.LastName)
-	}
-	if u.Username != "alice" {
-		t.Errorf("username = %q", u.Username)
-	}
-	if !u.IsPremium {
-		t.Error("is_premium not parsed")
-	}
-	if !u.AllowsWriteToPm {
-		t.Error("allows_write_to_pm not parsed")
-	}
-}
-
-// helpers
-func itoa(n int64) string {
-	return strconv.FormatInt(n, 10)
 }

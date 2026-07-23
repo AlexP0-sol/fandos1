@@ -24,8 +24,8 @@ import (
 // V5 payload (для POST): timestamp + api_key + recv_window + body_json
 // signature = HMAC-SHA256(secret, payload), hex-encoded.
 type Signer struct {
-	apiKey  string
-	secret  []byte
+	apiKey string
+	secret []byte
 }
 
 // NewSigner создаёт signer. secret копируется во внутренний буфер.
@@ -69,21 +69,17 @@ func (s *Signer) Zero() {
 	}
 }
 
-// AuthParamsQuery возвращает query-строку с обязательными параметрами (api_key, timestamp,
-// recv_window) — без sign. sign добавляется отдельно как завершающий параметр.
-func (s *Signer) AuthParamsQuery(timestampMs int64, recvWindowMs int64) string {
-	return "api_key=" + s.apiKey +
-		"&timestamp=" + strconv.FormatInt(timestampMs, 10) +
-		"&recv_window=" + strconv.FormatInt(recvWindowMs, 10)
-}
-
-// AppendSign добавляет signature к query.
-// Используется для GET-запросов в Bybit V5: все параметры в query.
-func AppendSign(query, signature string) string {
-	if query == "" {
-		return "sign=" + signature
+// AuthHeaders возвращает обязательные заголовки аутентификации Bybit V5.
+// В V5 аутентификация идёт ТОЛЬКО через заголовки (не через query-параметры,
+// как в устаревших v2/v3 API): X-BAPI-API-KEY, X-BAPI-TIMESTAMP,
+// X-BAPI-RECV-WINDOW, X-BAPI-SIGN. signature — результат SignGet/SignPost.
+func (s *Signer) AuthHeaders(timestampMs int64, recvWindowMs int64, signature string) map[string]string {
+	return map[string]string{
+		"X-BAPI-API-KEY":     s.apiKey,
+		"X-BAPI-TIMESTAMP":   strconv.FormatInt(timestampMs, 10),
+		"X-BAPI-RECV-WINDOW": strconv.FormatInt(recvWindowMs, 10),
+		"X-BAPI-SIGN":        signature,
 	}
-	return query + "&sign=" + signature
 }
 
 // BuildSortedQuery — Bybit V5 ожидает параметры в query в ЛЮБОМ порядке,

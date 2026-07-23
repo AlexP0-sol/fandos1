@@ -1,7 +1,8 @@
 # Bybit Linear USDT Perpetual — контракт адаптера
 
-> **ВАЖНО (раздел 2 промпта v2):** сверить с актуальной документацией
-> https://bybit-exchange.github.io/docs/v5/intro перед production-интеграцией.
+> **ВАЖНО (раздел 2 промпта v2):** все пути endpoint-ов ОБЯЗАТЕЛЬНО сверить с актуальной
+> официальной документацией https://bybit-exchange.github.io/docs/v5/intro перед
+> production-интеграцией. Bybit меняет пути между минорными версиями API без предупреждения.
 
 ## Дата проверки
 Заготовка — 2026-07. Требует верификации.
@@ -57,12 +58,16 @@ API Key, API Secret. Passphrase НЕ требуется (в отличие от 
 - `POST /v5/order/create` — разместить (orderLinkId=clientOrderId).
 - `POST /v5/order/cancel` — отменить.
 - `GET /v5/order/realtime?orderLinkId=` — query.
-- `POST /v5/account/set-leverage` — set leverage.
+- `POST /v5/position/set-leverage` — установить плечо (не /v5/account/set-leverage).
 - `POST /v5/account/set-margin-mode` — ISOLATED/CROSS.
+- `POST /v5/asset/transfer/inter-transfer` — внутренний перевод между sub-аккаунтами.
+- `POST /v5/asset/withdraw/create` — вывод (category=linear где применимо).
 
 ## Приватные WS
 - Auth: `{"op":"auth","args":[api_key, expires_ms, signature]}`.
-- Topics: `order`, `position`, `execution`, `wallet`, `position`.
+- Topics: `order`, `execution`, `position`, `wallet`.
+  - Отдельного `funding` topic нет: начисления funding приходят через обновления
+    `position` и `wallet` (поле `unrealisedPnl` / `walletBalance`).
 
 ## Funding
 - Bybit V5 Linear: интервал 8h по умолчанию, но некоторые инструменты 1h/4h.
@@ -70,10 +75,11 @@ API Key, API Secret. Passphrase НЕ требуется (в отличие от 
 - fundingRate × notional, positive → long платит short.
 
 ## ADL
-- `GET /v5/account/adl-list?category=linear` — индикатор ADL per-symbol.
+- Отдельного endpoint `/v5/account/adl-list` в V5 не существует.
+- ADL-ранг приходит в поле `adlRankIndicator` ответа `GET /v5/position/list`.
 
 ## Position mode
-- One-way / Hedge через `POST /v5/account/position-mode`.
+- One-way / Hedge через `POST /v5/position/switch-mode` (не /v5/account/position-mode).
 
 ## Rate limits
 - V5 использует weight-based лимиты (не count-based).

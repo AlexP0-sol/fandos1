@@ -25,6 +25,14 @@ import (
 	sp "github.com/shopspring/decimal"
 )
 
+// init фиксирует точность деления shopspring для всего процесса.
+// Значение по умолчанию (16 знаков) может незаметно обрезать хвост при цепочках
+// делений; 28 знаков — консервативный запас для риск-контура (ADR-0002).
+// Все округления в бизнес-логике должны выполняться ЯВНО (Round/Truncate/Quantize).
+func init() {
+	sp.DivisionPrecision = 28
+}
+
 // ============================================================
 // Decimal — риск-контур
 // ============================================================
@@ -140,9 +148,12 @@ func (d Decimal) LessThanOrEqual(o Decimal) bool { return d.v.LessThanOrEqual(o.
 // MulInt умножает на целое (частый случай: qty × price, qty × leverage).
 func (d Decimal) MulInt(i int64) Decimal { return Decimal{v: d.v.Mul(sp.New(i, 0))} }
 
-// Round округляет до precision знаков банковским (RoundHalfEven) округлением.
+// Round округляет до precision знаков банковским округлением (round half to even):
+// 0.125 → 0.12, 0.135 → 0.14. Детерминированно и без систематического смещения —
+// подходит для отчётных величин (PnL, fees). Для объёмов ордеров использовать
+// Quantize/Truncate (округление вниз, раздел 9.2).
 func (d Decimal) Round(precision int32) Decimal {
-	return Decimal{v: d.v.Round(precision)}
+	return Decimal{v: d.v.RoundBank(precision)}
 }
 
 // Truncate обрезает до precision знаков без округления (к нулю).
@@ -227,7 +238,8 @@ func NewFixed(unscaled int64, scale int8) (Fixed64, error) {
 	if scale < 0 || scale > 18 {
 		return Fixed64{}, fmt.Errorf("fixed64: scale %d out of range [0,18]", scale)
 	}
-	return Fixed64{unscaled: unscaled, scale: scale}, nil}
+	return Fixed64{unscaled: unscaled, scale: scale}, nil
+}
 
 // MustFixed — NewFixed, паникующий при ошибке (только для констант в коде).
 func MustFixed(unscaled int64, scale int8) Fixed64 {
@@ -265,6 +277,10 @@ func addUnscaled(a, b int64) (int64, error) {
 func mulUnscaled(a, b int64) (int64, error) {
 	if a == 0 || b == 0 {
 		return 0, nil
+	}
+	// MinInt64 × -1 переполняется, а MinInt64 / -1 паникует в Go — отсекаем явно.
+	if (a == math.MinInt64 && b == -1) || (b == math.MinInt64 && a == -1) {
+		return 0, errOverflow
 	}
 	r := a * b
 	if r/b != a {
@@ -344,34 +360,37 @@ func FromDecimal(d Decimal, scale int8) (Fixed64, error) {
 	if !trunc.Equal(d.v) {
 		return Fixed64{}, fmt.Errorf("fixed64: lossy conversion %s at scale %d", d.String(), scale)
 	}
-		// Извлекаем unscaled: value × 10^scale как точное целое.
-		// sp.New(1, exp) = 1 × 10^exp, поэтому для умножения на 10^scale нужен +scale.
-		unscaled := trunc.Mul(sp.New(1, int32(scale))) // value × 10^scale
+	// Извлекаем unscaled: value × 10^scale как точное целое.
+	// sp.New(1, exp) = 1 × 10^exp, поэтому для умножения на 10^scale нужен +scale.
+	unscaled := trunc.Mul(sp.New(1, int32(scale))) // value × 10^scale
 	if !unscaled.IsInteger() {
 		return Fixed64{}, fmt.Errorf("fixed64: cannot represent %s as int64 at scale %d", d.String(), scale)
 	}
-		// IntPart() возвращает усечённое к нулю целое (ok, т.к. IsInteger == true).
-		unscaledInt := unscaled.IntPart()
-		// Проверяем переполнение: IntPart возвращает int64 с truncation при overflow,
-		// но поскольку мы умножили на 10^scale, проверяем через обратное преобразование.
-		verifier := sp.New(unscaledInt, 0)
-		if !verifier.Equal(unscaled) {
-			return Fixed64{}, errOverflow
-		}
-		return Fixed64{unscaled: unscaledInt, scale: scale}, nil
+	// IntPart() возвращает усечённое к нулю целое (ok, т.к. IsInteger == true).
+	unscaledInt := unscaled.IntPart()
+	// Проверяем переполнение: IntPart возвращает int64 с truncation при overflow,
+	// но поскольку мы умножили на 10^scale, проверяем через обратное преобразование.
+	verifier := sp.New(unscaledInt, 0)
+	if !verifier.Equal(unscaled) {
+		return Fixed64{}, errOverflow
+	}
+	return Fixed64{unscaled: unscaledInt, scale: scale}, nil
 }
 
-// StringFixed64 — каноничная строка Fixed64 (для сериализации в БД/логи).
+// String — каноничная строка Fixed64 (для сериализации в БД/логи).
 func (f Fixed64) String() string {
 	if f.scale == 0 {
 		return strconv.FormatInt(f.unscaled, 10)
 	}
 	neg := f.unscaled < 0
-	u := f.unscaled
+	var u uint64
 	if neg {
-		u = -u
+		// Через uint64: -MinInt64 не представим в int64.
+		u = uint64(-(f.unscaled + 1)) + 1
+	} else {
+		u = uint64(f.unscaled)
 	}
-	str := strconv.FormatInt(u, 10)
+	str := strconv.FormatUint(u, 10)
 	// Дополняем нулями слева до scale+1.
 	for int8(len(str)) <= f.scale {
 		str = "0" + str

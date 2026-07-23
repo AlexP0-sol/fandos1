@@ -10,6 +10,7 @@ package instrument
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -40,6 +41,10 @@ type Registry struct {
 
 	// lastRefresh — время последнего успешного обновления (для health/UI).
 	lastRefresh time.Time
+
+	// duplicates — число дубликатов ключа (exchange, asset), встреченных при Replace.
+	// Ненулевое значение указывает на баг в адаптере (конфликт нормализации).
+	duplicates int
 }
 
 type registryKey struct {
@@ -65,6 +70,10 @@ func New() *Registry {
 // Replace атомарно заменяет всё содержимое реестра новым снимком инструментов.
 // Вызывается Level 1-задачей (каждые 30–60 мин) после получения GetInstruments от биржи.
 // Все in-flight читатели продолжат видеть консистентный снимок (RWMutex).
+//
+// При дубликате ключа (exchange, asset) побеждает последний элемент (last-wins),
+// а счётчик Duplicates в Stats инкрементируется — сигнал о баге в адаптере.
+// canonicalAssets после Replace отсортирован лексикографически (детерминированный порядок).
 func (r *Registry) Replace(all []domain.CanonicalInstrument) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -76,6 +85,7 @@ func (r *Registry) Replace(all []domain.CanonicalInstrument) {
 	r.byAsset = make(map[domain.AssetSymbol][]domain.CanonicalInstrument)
 
 	assetSet := make(map[domain.AssetSymbol]struct{})
+	dups := 0
 
 	for _, ins := range all {
 		// Пропускаем инструменты не нашего типа (раздел 1.1: только LINEAR_USDT_PERPETUAL).
@@ -88,8 +98,11 @@ func (r *Registry) Replace(all []domain.CanonicalInstrument) {
 		}
 
 		key := registryKey{exchange: ins.Exchange, asset: ins.CanonicalBaseAsset}
-		// Если уже есть запись с тем же ключом — это конфликт нормализации; последняя выигрывает,
-		// но это сигнал о баге в адаптере. В production здесь должен быть metric/log; в v1 — silent override.
+		// Если уже есть запись с тем же ключом — это конфликт нормализации; last-wins,
+		// счётчик дубликатов инкрементируется как сигнал о баге в адаптере.
+		if _, exists := r.byKey[key]; exists {
+			dups++
+		}
 		r.byKey[key] = ins
 		r.byExchangeSymbol[symbolKey{exchange: ins.Exchange, symbol: ins.ExchangeSymbol}] = ins
 		r.byExchange[ins.Exchange] = append(r.byExchange[ins.Exchange], ins)
@@ -97,11 +110,16 @@ func (r *Registry) Replace(all []domain.CanonicalInstrument) {
 		assetSet[ins.CanonicalBaseAsset] = struct{}{}
 	}
 
-	// Упорядоченный список канонических активов.
+	r.duplicates = dups
+
+	// Упорядоченный список канонических активов (сортировка — детерминированный порядок).
 	r.canonicalAssets = r.canonicalAssets[:0]
 	for a := range assetSet {
 		r.canonicalAssets = append(r.canonicalAssets, a)
 	}
+	sort.Slice(r.canonicalAssets, func(i, j int) bool {
+		return r.canonicalAssets[i] < r.canonicalAssets[j]
+	})
 
 	r.lastRefresh = time.Now()
 }
@@ -179,6 +197,9 @@ type Stats struct {
 	ByExchange       map[domain.ExchangeID]int
 	ByAsset          map[domain.AssetSymbol]int
 	LastRefresh      time.Time
+	// Duplicates — число дубликатов ключа (exchange, asset) при последнем Replace.
+	// Ненулевое значение указывает на баг в адаптере нормализации.
+	Duplicates int
 }
 
 // Stats возвращает сводку по реестру.
@@ -190,6 +211,7 @@ func (r *Registry) Stats() Stats {
 		ByExchange:       make(map[domain.ExchangeID]int, len(r.byExchange)),
 		ByAsset:          make(map[domain.AssetSymbol]int, len(r.byAsset)),
 		LastRefresh:      r.lastRefresh,
+		Duplicates:       r.duplicates,
 	}
 	for ex, list := range r.byExchange {
 		s.ByExchange[ex] = len(list)

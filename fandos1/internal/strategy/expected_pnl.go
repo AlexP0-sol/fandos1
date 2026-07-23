@@ -30,12 +30,12 @@ import (
 // Заполняется scanner-ом из market data и настроек пользователя.
 type PnLInput struct {
 	// Положительные компоненты (что приносит доход).
-	ExpectedFundingPnL   decimal.Decimal // из SumExpectedFundingCashFlow
-	ExpectedBasisPnL     decimal.Decimal // из VWAP basis (entry + exit)
+	ExpectedFundingPnL decimal.Decimal // из SumExpectedFundingCashFlow
+	ExpectedBasisPnL   decimal.Decimal // из VWAP basis (entry + exit)
 
 	// Отрицательные компоненты (что отнимает).
-	EstimatedEntryFees   decimal.Decimal
-	EstimatedExitFees    decimal.Decimal
+	EstimatedEntryFees     decimal.Decimal
+	EstimatedExitFees      decimal.Decimal
 	EstimatedEntrySlippage decimal.Decimal
 	EstimatedExitSlippage  decimal.Decimal
 
@@ -49,8 +49,8 @@ type PnLInput struct {
 
 // PnLBreakdown — детализированный расчёт для UI (раздел 14.2 «все резервы»).
 type PnLBreakdown struct {
-	Net         decimal.Decimal
-	Components  []PnLComponent // упорядоченный список для отображения
+	Net        decimal.Decimal
+	Components []PnLComponent // упорядоченный список для отображения
 }
 
 // PnLComponent — одна строка детализации.

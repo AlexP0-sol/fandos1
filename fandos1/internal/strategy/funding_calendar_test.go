@@ -159,8 +159,8 @@ func TestDegradeConfidence(t *testing.T) {
 // но если ставки разные — остаётся net edge.
 func TestSumExpectedFundingCashFlow(t *testing.T) {
 	events := []FundingEvent{
-		{EstimatedCashFlow: decimal.MustFromString("-1")},   // long платит 1
-		{EstimatedCashFlow: decimal.MustFromString("3.5")},  // short получает 3.5
+		{EstimatedCashFlow: decimal.MustFromString("-1")},  // long платит 1
+		{EstimatedCashFlow: decimal.MustFromString("3.5")}, // short получает 3.5
 	}
 	sum := SumExpectedFundingCashFlow(events)
 	if !sum.Equal(decimal.MustFromString("2.5")) {
@@ -172,7 +172,7 @@ func TestSumExpectedFundingCashFlow(t *testing.T) {
 func TestClassifySameAligned(t *testing.T) {
 	t1 := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
 	t2 := t1.Add(30 * time.Second) // skew 30s
-	c := ClassifyInterval(8*time.Hour, 8*time.Hour, t1, t2, true, 1*time.Minute)
+	c := ClassifyInterval(8*time.Hour, 8*time.Hour, t1, t2, 1*time.Minute)
 	if c != ClassSameIntervalAligned {
 		t.Errorf("class = %s, want SAME_INTERVAL_ALIGNED", c)
 	}
@@ -182,7 +182,7 @@ func TestClassifySameAligned(t *testing.T) {
 func TestClassifySameUnaligned(t *testing.T) {
 	t1 := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
 	t2 := t1.Add(10 * time.Minute) // skew 10min > maxSkew 1min
-	c := ClassifyInterval(8*time.Hour, 8*time.Hour, t1, t2, true, 1*time.Minute)
+	c := ClassifyInterval(8*time.Hour, 8*time.Hour, t1, t2, 1*time.Minute)
 	if c != ClassSameIntervalUnaligned {
 		t.Errorf("class = %s, want SAME_INTERVAL_UNALIGNED", c)
 	}
@@ -190,7 +190,7 @@ func TestClassifySameUnaligned(t *testing.T) {
 
 // TestClassifyDifferent — разные интервалы.
 func TestClassifyDifferent(t *testing.T) {
-	c := ClassifyInterval(8*time.Hour, 4*time.Hour, time.Now(), time.Now(), true, time.Minute)
+	c := ClassifyInterval(8*time.Hour, 4*time.Hour, time.Now(), time.Now(), time.Minute)
 	if c != ClassDifferentInterval {
 		t.Errorf("class = %s, want DIFFERENT_INTERVAL", c)
 	}
@@ -203,14 +203,14 @@ func TestBuildCalendarDifferentIntervals(t *testing.T) {
 
 	longEvents := BuildFundingCalendar(CalendarInput{
 		Exchange: domain.ExchangeBinance, Side: domain.SideLong,
-		PredictedRate: decimal.MustFromString("0.0001"),
+		PredictedRate:   decimal.MustFromString("0.0001"),
 		FundingInterval: 8 * time.Hour, NextFundingTime: now.Add(8 * time.Hour),
 		Horizon: 16 * time.Hour, Confidence: domain.ConfidenceHigh,
 		Notional: decimal.FromInt(1000),
 	}, now)
 	shortEvents := BuildFundingCalendar(CalendarInput{
 		Exchange: domain.ExchangeBybit, Side: domain.SideShort,
-		PredictedRate: decimal.MustFromString("0.0003"),
+		PredictedRate:   decimal.MustFromString("0.0003"),
 		FundingInterval: 4 * time.Hour, NextFundingTime: now.Add(4 * time.Hour),
 		Horizon: 16 * time.Hour, Confidence: domain.ConfidenceHigh,
 		Notional: decimal.FromInt(1000),

@@ -12,6 +12,8 @@
 package risk
 
 import (
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/thecd/fundarbitrage/internal/decimal"
@@ -20,28 +22,29 @@ import (
 
 // Limits — risk-лимиты для проверки (подмножество HotSettings, раздел 5.2).
 type Limits struct {
-	DeltaToleranceBase        decimal.Decimal
-	DeltaToleranceUSD         decimal.Decimal
-	MaxDailyLossUSDT          decimal.Decimal
-	MaxPositionLossUSDT       decimal.Decimal
+	DeltaToleranceBase                  decimal.Decimal
+	DeltaToleranceUSD                   decimal.Decimal
+	MaxDailyLossUSDT                    decimal.Decimal
+	MaxPositionLossUSDT                 decimal.Decimal
 	MinimumDistanceToLiquidationPercent decimal.Decimal // минимальная дистанция до ликвидации, %
-	EmergencyMarginRatio      decimal.Decimal // при каком margin ratio — экстренное закрытие
-	MaxExposurePerExchangeUSDT map[domain.ExchangeID]decimal.Decimal
-	ADLExposureLimitPercent   map[domain.ExchangeID]decimal.Decimal
-	CounterpartyHaircutPercent map[domain.CounterpartyRiskTier]decimal.Decimal
-	RiskSnapAfterMaxDailyLoss bool
+	EmergencyMarginRatio                decimal.Decimal // при каком margin ratio — экстренное закрытие
+	MaxExposurePerExchangeUSDT          map[domain.ExchangeID]decimal.Decimal
+	ADLExposureLimitPercent             map[domain.ExchangeID]decimal.Decimal
+	// CounterpartyHaircutFraction — доля notional в резерв по tier биржи (дробное значение, не %).
+	CounterpartyHaircutFraction map[domain.CounterpartyRiskTier]decimal.Decimal
+	RiskSnapAfterMaxDailyLoss   bool
 }
 
 // PositionInput — рыночные данные одной позиции для risk-check.
 type PositionInput struct {
-	Asset              domain.AssetSymbol
-	LongExchange       domain.ExchangeID
-	ShortExchange      domain.ExchangeID
-	LongBaseQty        decimal.Decimal
-	ShortBaseQty       decimal.Decimal // abs
-	MarkPrice          decimal.Decimal // консервативная цена для DeltaUSD
-	UnrealizedPnL      decimal.Decimal
-	MarginRatioPerLeg  map[domain.ExchangeID]decimal.Decimal // 0..1, выше = ближе к ликвидации
+	Asset                      domain.AssetSymbol
+	LongExchange               domain.ExchangeID
+	ShortExchange              domain.ExchangeID
+	LongBaseQty                decimal.Decimal
+	ShortBaseQty               decimal.Decimal // abs
+	MarkPrice                  decimal.Decimal // консервативная цена для DeltaUSD
+	UnrealizedPnL              decimal.Decimal
+	MarginRatioPerLeg          map[domain.ExchangeID]decimal.Decimal // 0..1, выше = ближе к ликвидации
 	LiquidationDistancePercent map[domain.ExchangeID]decimal.Decimal
 }
 
@@ -59,6 +62,8 @@ type Violation struct {
 	Severity Severity
 	Code     string
 	Message  string
+	// Exchange — биржа, связанная с нарушением. Нулевое значение означает «не привязано к бирже».
+	Exchange domain.ExchangeID
 }
 
 // CheckResult — итог проверки одной позиции.
@@ -89,6 +94,9 @@ func (r CheckResult) HasWarning() bool {
 }
 
 // CheckPosition — проверяет инварианты одной позиции (раздел 3.5, 5.2, 11.2).
+// ОБЯЗАТЕЛЬНО вызывается execution-координатором ПЕРЕД любым PlaceOrder:
+// нарушение дельта-нейтральности или приближение к ликвидации требует немедленного
+// решения (закрыть/остановить) до размещения новых ордеров.
 func CheckPosition(p PositionInput, limits Limits) CheckResult {
 	res := CheckResult{}
 
@@ -112,29 +120,40 @@ func CheckPosition(p PositionInput, limits Limits) CheckResult {
 	}
 
 	// 2. Margin ratio (раздел 5.2, 11.2 P0).
-	for ex, mr := range p.MarginRatioPerLeg {
-		if mr.GreaterThanOrEqual(limits.EmergencyMarginRatio) {
-			res.Violations = append(res.Violations, Violation{
-				Severity: SeverityCritical,
-				Code:     "EMERGENCY_MARGIN_RATIO",
-				Message:  "margin ratio достиг emergency уровня — риск ликвидации",
-			})
-			break
+	// Итерируем по отсортированным ключам для детерминированного вывода.
+	// Одно нарушение per breaching exchange (без break).
+	{
+		keys := sortedExchangeKeys(p.MarginRatioPerLeg)
+		for _, ex := range keys {
+			mr := p.MarginRatioPerLeg[ex]
+			if mr.GreaterThanOrEqual(limits.EmergencyMarginRatio) {
+				res.Violations = append(res.Violations, Violation{
+					Severity: SeverityCritical,
+					Code:     "EMERGENCY_MARGIN_RATIO",
+					Message:  fmt.Sprintf("margin ratio на бирже %s достиг emergency уровня — риск ликвидации", ex),
+					Exchange: ex,
+				})
+				// Не break: фиксируем нарушение по каждой бирже.
+			}
 		}
-		_ = ex
 	}
 
 	// 3. Liquidation distance.
-	for ex, dist := range p.LiquidationDistancePercent {
-		if dist.LessThan(limits.MinimumDistanceToLiquidationPercent) {
-			res.Violations = append(res.Violations, Violation{
-				Severity: SeverityCritical,
-				Code:     "LIQUIDATION_TOO_CLOSE",
-				Message:  "дистанция до liquidation ниже минимума",
-			})
-			break
+	// Одно нарушение per breaching exchange (без break).
+	{
+		keys := sortedExchangeKeys(p.LiquidationDistancePercent)
+		for _, ex := range keys {
+			dist := p.LiquidationDistancePercent[ex]
+			if dist.LessThan(limits.MinimumDistanceToLiquidationPercent) {
+				res.Violations = append(res.Violations, Violation{
+					Severity: SeverityCritical,
+					Code:     "LIQUIDATION_TOO_CLOSE",
+					Message:  fmt.Sprintf("дистанция до liquidation на бирже %s ниже минимума", ex),
+					Exchange: ex,
+				})
+				// Не break: фиксируем нарушение по каждой бирже.
+			}
 		}
-		_ = ex
 	}
 
 	// 4. Max position loss.
@@ -152,18 +171,34 @@ func CheckPosition(p PositionInput, limits Limits) CheckResult {
 	return res
 }
 
+// sortedExchangeKeys возвращает ключи map в отсортированном порядке (детерминизм).
+func sortedExchangeKeys(m map[domain.ExchangeID]decimal.Decimal) []domain.ExchangeID {
+	keys := make([]domain.ExchangeID, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return string(keys[i]) < string(keys[j])
+	})
+	return keys
+}
+
 // DailyLossStatus — состояние дневного стопа (раздел 5.2 RiskSnapAfterMaxDailyLoss).
 type DailyLossStatus struct {
-	Date            time.Time // торговый день (UTC, midnight-aligned)
+	Date             time.Time       // торговый день (UTC, midnight-aligned)
 	RealisedLossUSDT decimal.Decimal // суммарный реализованный убыток за день (только negative PnL)
-	Snapped         bool // true, если сработал RiskSnapAfterMaxDailyLoss → SAFE_HALT
+	Snapped          bool            // true, если сработал RiskSnapAfterMaxDailyLoss → SAFE_HALT
 }
 
 // CheckDailyLoss — проверка дневного лимита убытка.
 // realizedPnLToday — суммарный реализованный PnL за день (может быть отрицательным).
-func CheckDailyLoss(realizedPnLToday decimal.Decimal, limits Limits) (DailyLossStatus, []Violation) {
+// date — торговый день (используется для заполнения DailyLossStatus.Date).
+func CheckDailyLoss(realizedPnLToday decimal.Decimal, limits Limits, date time.Time) (DailyLossStatus, []Violation) {
 	var vs []Violation
-	st := DailyLossStatus{RealisedLossUSDT: decimal.Zero}
+	st := DailyLossStatus{
+		Date:             date,
+		RealisedLossUSDT: decimal.Zero,
+	}
 
 	// Убыток — только отрицательная часть.
 	loss := decimal.Zero

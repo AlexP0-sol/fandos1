@@ -4,23 +4,27 @@
 // выхода. Они могут закрыть один leg раньше второго и создать направленную экспозицию.
 //
 // Алгоритм coordinated close:
-//  1. Перевести позицию в EXIT_REQUESTED, заблокировать новые slices.
-//  2. Отменить все entry/pending/несовместимые conditional orders.
-//  3. Считать актуальные позиции обеих ног.
-//  4. Вычислить общий base quantity, который можно закрыть синхронно.
+//  1. Перевести позицию в EXIT_REQUESTED, заблокировать новые slices (вызывающий).
+//  2. Отменить все entry/pending/несовместимые conditional orders (вызывающий).
+//  3. Считать актуальные позиции обеих ног (вызывающий; сюда приходят remaining).
+//  4. Общая цель закрытия = min(longRemaining, shortRemaining); излишек большей ноги —
+//     зона ответственности repair (RepairReduceExcess), не coordinated close.
 //  5. Одновременно отправить reduce-only marketable IOC на обеих биржах.
-//  6. long leg: limit = bestBid - CloseProtectionTicks × tickSize.
+//  6. long leg: limit = bestBid − CloseProtectionTicks × tickSize;
 //     short leg: limit = bestAsk + CloseProtectionTicks × tickSize.
 //  7. Дождаться executions (не только ack).
-//  8. При частичном исполнении выровнять legs до минимального общего остатка.
-//  9. Повторять закрытие оставшейся части с bounded числом requotes.
-// 10. При критическом риске применять UltimateEmergencyClosePolicy.
-// 11. После закрытия — REST+WS reconciliation, отмена остаточных ордеров.
+//  8. Учёт per-leg: каждая нога ведёт СВОЙ остаток. Недобранная нога досылается
+//     на следующей попытке своим объёмом — ноги сходятся к нулю, а не «по минимуму».
+//  9. Повторять с bounded числом requotes.
+//  10. Неопределённое состояние ноги (ack+query таймаут) → НЕМЕДЛЕННЫЙ выход с
+//     ErrCloseAmbiguous: продолжать нельзя, нужна reconciliation (раздел 10.2, 28).
+//  11. После закрытия — REST+WS reconciliation, отмена остаточных ордеров (вызывающий).
 package execution
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/thecd/fundarbitrage/internal/decimal"
@@ -30,15 +34,10 @@ import (
 
 // CloseConfig — параметры закрытия (раздел 5.3, 11.3).
 type CloseConfig struct {
-	CloseProtectionTicks int            // сколько тиков уступать от best price
-	MaxRequotes          int            // bounded число повторных попыток
-	UltimatePolicy       string         // STRICT_PRICE_GUARD / ESCALATING / EMERGENCY_MARKET
+	CloseProtectionTicks int // сколько тиков уступать от best price
+	MaxRequotes          int // bounded число повторных попыток
 	TickSize             decimal.Decimal
-	OrderAckTimeout      // поля заполняются вызывающим
 }
-
-// OrderAckTimeout — анти-поле для избежания конфликтов; оставляем как часть конфига.
-type OrderAckTimeout struct{}
 
 // CloseRequest — параметры одной операции закрытия.
 type CloseRequest struct {
@@ -63,134 +62,187 @@ type BookProvider interface {
 	BestAsk(symbol domain.ExchangeSymbol) (decimal.Decimal, bool)
 }
 
-// CloseResult — исход coordinated close.
+// CloseResult — исход coordinated close. Счётчики отражают ФАКТИЧЕСКИ закрытое
+// per-leg (не min) — искажение учёта здесь означало бы скрытую направленную экспозицию.
 type CloseResult struct {
 	LongClosedQty  decimal.Decimal
 	ShortClosedQty decimal.Decimal
-	Degraded       bool   // true, если не удалось закрыть синхронно
-	Reason         string // объяснение при Degraded
+	// Residual* — незакрытый остаток цели закрытия по каждой ноге.
+	// Ненулевой остаток → позиция в DEGRADED/RECONCILING, решает вызывающий.
+	ResidualLongQty  decimal.Decimal
+	ResidualShortQty decimal.Decimal
+	Degraded         bool   // true, если закрыть цель полностью не удалось
+	Reason           string // объяснение при Degraded
 }
 
-// ErrCloseIncomplete — закрыто не полностью, нужна эскалация.
+// ErrCloseIncomplete — закрыто не полностью, нужна эскалация (bounded requotes исчерпаны).
 var ErrCloseIncomplete = errors.New("execution: coordinated close incomplete")
 
+// ErrCloseAmbiguous — состояние ноги после попытки закрытия НЕИЗВЕСТНО
+// (ack и query таймаутили). Продолжать нельзя: возможен незамеченный fill.
+// Вызывающий обязан выполнить reconciliation (REST+WS) до любых новых ордеров.
+var ErrCloseAmbiguous = errors.New("execution: leg state unknown after close attempt, reconciliation required")
+
+// legAttemptResult — исход одной попытки на одной ноге.
+type legAttemptResult struct {
+	filled    decimal.Decimal
+	ambiguous bool  // состояние неизвестно (timeout/network на place И query)
+	err       error // прочие ошибки (reject, rate limit, ...)
+}
+
 // CoordinatedClose выполняет синхронное закрытие обеих ног (раздел 11.3).
-// Возвращает ошибку, если закрыть не удалось; result.Degraded=true при частичном успехе.
+//
+// Цель закрытия = min(LongRemaining, ShortRemaining) на КАЖДОЙ ноге: coordinated close
+// уменьшает обе ноги на одинаковую величину, сохраняя дельту; излишек большей ноги
+// устраняет repair (RepairReduceExcess) отдельным reduce-only ордером.
+//
+// Каждая нога ведёт собственный остаток: если long исполнился на 10, а short на 4,
+// следующая попытка отправит long 0 (или его остаток) и short 6 — ноги сходятся к нулю.
+// Возвращает ErrCloseAmbiguous при неопределённом состоянии (нужна reconciliation),
+// ErrCloseIncomplete при исчерпании requotes с остатком.
 func CoordinatedClose(ctx context.Context, req CloseRequest, cfg CloseConfig) (CloseResult, error) {
 	result := CloseResult{}
 
-	// Общий объём, который можно закрыть синхронно = min(longRemaining, shortRemaining).
-	common := req.LongRemaining
-	if req.ShortRemaining.LessThan(common) {
-		common = req.ShortRemaining
-	}
-	if !common.IsPositive() {
+	// Цель: одинаковое уменьшение обеих ног.
+	target := decimal.Min(req.LongRemaining, req.ShortRemaining)
+	if !target.IsPositive() {
 		return result, nil // нечего закрывать
 	}
+	longLeft, shortLeft := target, target
+
+	protection := cfg.TickSize.MulInt(int64(cfg.CloseProtectionTicks))
 
 	for attempt := 0; attempt <= cfg.MaxRequotes; attempt++ {
-		if !common.IsPositive() {
-			break
-		}
-		// Получаем актуальные best prices.
-		longBid, ok := req.LongBookProvider.BestBid(req.LongSymbol)
-		if !ok {
-			result.Degraded = true
-			result.Reason = "no long bid for close price"
-			return result, ErrCloseIncomplete
-		}
-		shortAsk, ok := req.ShortBookProvider.BestAsk(req.ShortSymbol)
-		if !ok {
-			result.Degraded = true
-			result.Reason = "no short ask for close price"
-			return result, ErrCloseIncomplete
+		if !longLeft.IsPositive() && !shortLeft.IsPositive() {
+			break // обе ноги закрыты полностью
 		}
 
-		// limit prices с protection (раздел 11.3 п.6, п.7).
-		protection := cfg.TickSize.MulInt(int64(cfg.CloseProtectionTicks))
-		longLimit := longBid.Sub(protection)   // продаём long чуть дешевле bid
-		shortLimit := shortAsk.Add(protection) // выкупаем short чуть дороже ask
-
-		// Формируем clientOrderID для этой попытки закрытия.
-		longID := Format(ClientOrderIDParts{
-			PositionID: req.PositionID, LegSide: domain.SideLong,
-			SliceIndex: attempt, Nonce: 0, Purpose: "EXIT",
-		})
-		shortID := Format(ClientOrderIDParts{
-			PositionID: req.PositionID, LegSide: domain.SideShort,
-			SliceIndex: attempt, Nonce: 0, Purpose: "EXIT",
-		})
+		// Цены нужны только для ног с остатком.
+		var longLimit, shortLimit decimal.Decimal
+		if longLeft.IsPositive() {
+			bid, ok := req.LongBookProvider.BestBid(req.LongSymbol)
+			if !ok {
+				return degraded(result, longLeft, shortLeft, "no long bid for close price"), ErrCloseIncomplete
+			}
+			longLimit = bid.Sub(protection) // продаём long чуть дешевле bid
+		}
+		if shortLeft.IsPositive() {
+			ask, ok := req.ShortBookProvider.BestAsk(req.ShortSymbol)
+			if !ok {
+				return degraded(result, longLeft, shortLeft, "no short ask for close price"), ErrCloseIncomplete
+			}
+			shortLimit = ask.Add(protection) // выкупаем short чуть дороже ask
+		}
 
 		// ОДНОВРЕМЕННАЯ отправка обеих ног (раздел 11.3 п.5).
-		var longRes, shortRes PlaceOrderResult
-		var longErr, shortErr error
+		var longRes, shortRes legAttemptResult
 		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			longRes, longErr = req.LongExecutor.Place(ctx, domain.PlaceOrderRequest{
-				ClientOrderID: longID,
-				Symbol:        req.LongSymbol,
-				Side:          domain.SideShort, // закрытие long = продажа
-				OrderMode:     domain.OrderMarketableLimitIOC,
-				BaseQty:       common,
-				Price:         longLimit,
-				ReduceOnly:    true,
-				TimeInForce:   domain.TIFIOC,
-			})
-		}()
-		go func() {
-			defer wg.Done()
-			shortRes, shortErr = req.ShortExecutor.Place(ctx, domain.PlaceOrderRequest{
-				ClientOrderID: shortID,
-				Symbol:        req.ShortSymbol,
-				Side:          domain.SideLong, // закрытие short = выкуп
-				OrderMode:     domain.OrderMarketableLimitIOC,
-				BaseQty:       common,
-				Price:         shortLimit,
-				ReduceOnly:    true,
-				TimeInForce:   domain.TIFIOC,
-			})
-		}()
+		if longLeft.IsPositive() {
+			wg.Add(1)
+			go func(qty, limit decimal.Decimal, att int) {
+				defer wg.Done()
+				longRes = placeCloseLeg(ctx, req.LongExecutor, domain.PlaceOrderRequest{
+					ClientOrderID: Format(ClientOrderIDParts{
+						PositionID: req.PositionID, LegSide: domain.SideLong,
+						SliceIndex: att, Nonce: 0, Purpose: "EXIT",
+					}),
+					Symbol:      req.LongSymbol,
+					Side:        domain.SideShort, // закрытие long = продажа
+					OrderMode:   domain.OrderMarketableLimitIOC,
+					BaseQty:     qty,
+					Price:       limit,
+					ReduceOnly:  true,
+					TimeInForce: domain.TIFIOC,
+				}, qty)
+			}(longLeft, longLimit, attempt)
+		}
+		if shortLeft.IsPositive() {
+			wg.Add(1)
+			go func(qty, limit decimal.Decimal, att int) {
+				defer wg.Done()
+				shortRes = placeCloseLeg(ctx, req.ShortExecutor, domain.PlaceOrderRequest{
+					ClientOrderID: Format(ClientOrderIDParts{
+						PositionID: req.PositionID, LegSide: domain.SideShort,
+						SliceIndex: att, Nonce: 0, Purpose: "EXIT",
+					}),
+					Symbol:      req.ShortSymbol,
+					Side:        domain.SideLong, // закрытие short = выкуп
+					OrderMode:   domain.OrderMarketableLimitIOC,
+					BaseQty:     qty,
+					Price:       limit,
+					ReduceOnly:  true,
+					TimeInForce: domain.TIFIOC,
+				}, qty)
+			}(shortLeft, shortLimit, attempt)
+		}
 		wg.Wait()
 
-		// Ошибки обеих ног — критично.
-		if longErr != nil && shortErr != nil {
-			result.Degraded = true
-			result.Reason = "both legs failed during close"
-			return result, ErrCloseIncomplete
+		// Неопределённое состояние ЛЮБОЙ ноги — немедленный стоп: возможен
+		// незамеченный fill; счётчики ниже включают только ПОДТВЕРЖДЁННЫЕ fills.
+		if longRes.ambiguous || shortRes.ambiguous {
+			result.LongClosedQty = result.LongClosedQty.Add(longRes.filled)
+			result.ShortClosedQty = result.ShortClosedQty.Add(shortRes.filled)
+			leg := "long"
+			if shortRes.ambiguous {
+				leg = "short"
+			}
+			if longRes.ambiguous && shortRes.ambiguous {
+				leg = "both"
+			}
+			return degraded(result,
+				longLeft.Sub(longRes.filled), shortLeft.Sub(shortRes.filled),
+				fmt.Sprintf("%s leg state unknown (ack+query timeout)", leg)), ErrCloseAmbiguous
 		}
 
-		// Считаем фактически закрытое.
-		longFilled := longRes.Order.FilledQty
-		shortFilled := shortRes.Order.FilledQty
-		if longErr != nil {
-			longFilled = decimal.Zero
-		}
-		if shortErr != nil {
-			shortFilled = decimal.Zero
-		}
+		// Учёт подтверждённых fills per-leg.
+		longLeft = longLeft.Sub(longRes.filled)
+		shortLeft = shortLeft.Sub(shortRes.filled)
+		result.LongClosedQty = result.LongClosedQty.Add(longRes.filled)
+		result.ShortClosedQty = result.ShortClosedQty.Add(shortRes.filled)
 
-		// Выравниваем: общий закрытый объём = min(longFilled, shortFilled) (раздел 11.3 п.8).
-		closedThisAttempt := longFilled
-		if shortFilled.LessThan(closedThisAttempt) {
-			closedThisAttempt = shortFilled
-		}
-
-		result.LongClosedQty = result.LongClosedQty.Add(closedThisAttempt)
-		result.ShortClosedQty = result.ShortClosedQty.Add(closedThisAttempt)
-		common = common.Sub(closedThisAttempt)
-
-		// Если обе ноги заполнились полностью на эту попытку — done.
-		if common.IsPositive() && attempt == cfg.MaxRequotes {
-			// Исчерпали requotes, но что-то осталось.
-			result.Degraded = true
-			result.Reason = "max requotes exhausted with residual"
-			return result, ErrCloseIncomplete
+		// Обе активные ноги отказали жёсткой ошибкой — прогресса не будет.
+		bothActive := longRes.err != nil && shortRes.err != nil
+		if bothActive && longRes.filled.IsZero() && shortRes.filled.IsZero() {
+			return degraded(result, longLeft, shortLeft, "both legs failed during close"), ErrCloseIncomplete
 		}
 	}
 
+	if longLeft.IsPositive() || shortLeft.IsPositive() {
+		return degraded(result, longLeft, shortLeft, "max requotes exhausted with residual"), ErrCloseIncomplete
+	}
 	return result, nil
+}
+
+// placeCloseLeg выполняет одну попытку закрытия одной ноги и классифицирует исход.
+// cap — верхняя граница засчитываемого fill (защита от некорректного оверфилла).
+func placeCloseLeg(ctx context.Context, exec *OrderExecutor, req domain.PlaceOrderRequest, capQty decimal.Decimal) legAttemptResult {
+	res, err := exec.Place(ctx, req)
+	if err == nil {
+		filled := res.Order.FilledQty
+		if filled.GreaterThan(capQty) {
+			filled = capQty
+		}
+		return legAttemptResult{filled: filled}
+	}
+	// Ордер точно не создан — безопасно считать fill = 0 и пробовать снова.
+	if errors.Is(err, exchange.ErrOrderNotFound) {
+		return legAttemptResult{filled: decimal.Zero, err: err}
+	}
+	// Timeout/network после query — состояние НЕИЗВЕСТНО.
+	if IsAmbiguousTimeout(err) {
+		return legAttemptResult{filled: decimal.Zero, ambiguous: true, err: err}
+	}
+	// Прочее (reject, rate limit, unauthorized) — fill = 0, ошибка зафиксирована.
+	return legAttemptResult{filled: decimal.Zero, err: err}
+}
+
+// degraded заполняет остатки и причину деградации.
+func degraded(r CloseResult, longLeft, shortLeft decimal.Decimal, reason string) CloseResult {
+	r.ResidualLongQty = decimal.Max(longLeft, decimal.Zero)
+	r.ResidualShortQty = decimal.Max(shortLeft, decimal.Zero)
+	r.Degraded = true
+	r.Reason = reason
+	return r
 }
 
 // CloseOneLegEmergency — экстренное закрытие одной ноги market-ордером (раздел 11.3 п.10,
@@ -198,6 +250,9 @@ func CoordinatedClose(ctx context.Context, req CloseRequest, cfg CloseConfig) (C
 // Используется ТОЛЬКО при критическом риске, когда координированное закрытие не успевает.
 func CloseOneLegEmergency(ctx context.Context, exec *OrderExecutor, symbol domain.ExchangeSymbol,
 	qty decimal.Decimal, side domain.Side, positionID domain.PositionID) error {
+	if !qty.IsPositive() {
+		return nil
+	}
 	id := Format(ClientOrderIDParts{
 		PositionID: positionID, LegSide: side, SliceIndex: 0, Nonce: 0, Purpose: "EMERGENCY",
 	})
@@ -211,8 +266,5 @@ func CloseOneLegEmergency(ctx context.Context, exec *OrderExecutor, symbol domai
 		ReduceOnly:    true,
 		TimeInForce:   domain.TIFIOC,
 	})
-	if err != nil && !errors.Is(err, exchange.ErrOrderNotFound) {
-		return err
-	}
-	return nil
+	return err
 }

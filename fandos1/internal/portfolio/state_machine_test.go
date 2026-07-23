@@ -114,6 +114,58 @@ func TestPersisterFailureRollsBack(t *testing.T) {
 	}
 }
 
+// TestPersistInProgress — параллельный TransitionTo возвращает ErrPersistInProgress,
+// пока первый выполняет персистенцию (TOCTOU-защита, раздел 10).
+func TestPersistInProgress(t *testing.T) {
+	p := newPos()
+	// Переводим в QUALIFIED, чтобы дальше было из чего переходить.
+	if err := p.TransitionTo(StateQualified, testNow, "q", "system", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// sleepingPersister задерживает OnTransition до сигнала release.
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	slow := &gatedPersister{entered: entered, release: release}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		// Goroutine 1: начинает переход QUALIFIED→PREPARING и виснет в persister.
+		firstDone <- p.TransitionTo(StatePreparing, testNow, "slow", "system", slow)
+	}()
+
+	// Ждём, пока goroutine 1 гарантированно окажется ВНУТРИ persister
+	// (persisting=true уже выставлен) — никакого гадания по таймерам.
+	<-entered
+
+	// Goroutine 2 (основная): параллельный переход обязан получить отказ.
+	secondErr := p.TransitionTo(StatePreparing, testNow, "concurrent", "system", nil)
+	if !errors.Is(secondErr, ErrPersistInProgress) {
+		t.Errorf("concurrent transition: expected ErrPersistInProgress, got %v", secondErr)
+	}
+
+	// Отпускаем persister и ждём завершения goroutine 1 через канал (без гонок).
+	close(release)
+	if firstErr := <-firstDone; firstErr != nil {
+		t.Errorf("first (slow) transition failed: %v", firstErr)
+	}
+	if p.CurrentState() != StatePreparing {
+		t.Errorf("state = %s, want PREPARING after slow persist", p.CurrentState())
+	}
+}
+
+// gatedPersister сигналит о входе в OnTransition и ждёт release.
+type gatedPersister struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedPersister) OnTransition(*Position, Transition) error {
+	close(g.entered)
+	<-g.release
+	return nil
+}
+
 // TestDegradedRecovery — из DEGRADED можно вернуться к закрытию.
 func TestDegradedRecovery(t *testing.T) {
 	p := newPos()
@@ -130,6 +182,23 @@ func TestDegradedRecovery(t *testing.T) {
 		if err := p.TransitionTo(s, testNow, "", "system", nil); err != nil {
 			t.Fatalf("DEGRADED recovery → %s: %v", s, err)
 		}
+	}
+}
+
+// TestDegradedToClosedDirect — DEGRADED → CLOSED — прямой переход разрешён.
+func TestDegradedToClosedDirect(t *testing.T) {
+	p := newPos()
+	_ = p.TransitionTo(StateQualified, testNow, "", "", nil)
+	_ = p.TransitionTo(StatePreparing, testNow, "", "", nil)
+	_ = p.TransitionTo(StateOpening, testNow, "", "", nil)
+	_ = p.TransitionTo(StateDegraded, testNow, "mismatch", "system", nil)
+
+	// DEGRADED → CLOSED напрямую.
+	if err := p.TransitionTo(StateClosed, testNow, "force close", "system", nil); err != nil {
+		t.Fatalf("DEGRADED → CLOSED should be allowed: %v", err)
+	}
+	if p.CurrentState() != StateClosed {
+		t.Errorf("state = %s, want CLOSED", p.CurrentState())
 	}
 }
 
@@ -158,13 +227,17 @@ func TestCanTransitionMatrix(t *testing.T) {
 // TestSetQuantitiesAndDelta — обновление quantities и расчёт дельты (раздел 3.5).
 func TestSetQuantitiesAndDelta(t *testing.T) {
 	p := newPos()
-	p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("50"), testNow)
+	if err := p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("50"), testNow); err != nil {
+		t.Fatal(err)
+	}
 	d := p.DeltaBase()
 	if !d.IsZero() {
 		t.Errorf("delta = %s, want 0 (hedged)", d.String())
 	}
 
-	p.SetQuantities(decimal.MustFromString("60"), decimal.MustFromString("50"), testNow)
+	if err := p.SetQuantities(decimal.MustFromString("60"), decimal.MustFromString("50"), testNow); err != nil {
+		t.Fatal(err)
+	}
 	d = p.DeltaBase()
 	want := decimal.MustFromString("10")
 	if !d.Equal(want) {
@@ -172,11 +245,38 @@ func TestSetQuantitiesAndDelta(t *testing.T) {
 	}
 }
 
+// TestSetQuantitiesTerminalError — SetQuantities на терминальной позиции возвращает ошибку.
+func TestSetQuantitiesTerminalError(t *testing.T) {
+	p := newPos()
+	_ = p.TransitionTo(StateQualified, testNow, "", "", nil)
+	_ = p.TransitionTo(StateFailed, testNow, "abort", "system", nil)
+	err := p.SetQuantities(decimal.MustFromString("1"), decimal.MustFromString("1"), testNow)
+	if !errors.Is(err, ErrPositionTerminalMutation) {
+		t.Errorf("expected ErrPositionTerminalMutation, got %v", err)
+	}
+}
+
+// TestAddPnLTerminalError — AddRealisedPnL/AddFundingPnL на терминальной позиции → ошибка.
+func TestAddPnLTerminalError(t *testing.T) {
+	p := newPos()
+	_ = p.TransitionTo(StateQualified, testNow, "", "", nil)
+	_ = p.TransitionTo(StateFailed, testNow, "abort", "system", nil)
+
+	if err := p.AddRealisedPnL(decimal.MustFromString("10"), testNow); !errors.Is(err, ErrPositionTerminalMutation) {
+		t.Errorf("AddRealisedPnL terminal: expected ErrPositionTerminalMutation, got %v", err)
+	}
+	if err := p.AddFundingPnL(decimal.MustFromString("5"), testNow); !errors.Is(err, ErrPositionTerminalMutation) {
+		t.Errorf("AddFundingPnL terminal: expected ErrPositionTerminalMutation, got %v", err)
+	}
+}
+
 // TestDeltaWithNegativeShort — abs(short) корректно считается.
 func TestDeltaWithNegativeShort(t *testing.T) {
 	p := newPos()
 	// Если short qty хранится как отрицательное (некоторые биржи так делают).
-	p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("-50"), testNow)
+	if err := p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("-50"), testNow); err != nil {
+		t.Fatal(err)
+	}
 	d := p.DeltaBase()
 	if !d.IsZero() {
 		t.Errorf("delta with negative short = %s, want 0", d.String())
@@ -186,9 +286,15 @@ func TestDeltaWithNegativeShort(t *testing.T) {
 // TestPnLAccumulation
 func TestPnLAccumulation(t *testing.T) {
 	p := newPos()
-	p.AddRealisedPnL(decimal.MustFromString("10"), testNow)
-	p.AddRealisedPnL(decimal.MustFromString("5"), testNow)
-	p.AddFundingPnL(decimal.MustFromString("3"), testNow)
+	if err := p.AddRealisedPnL(decimal.MustFromString("10"), testNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AddRealisedPnL(decimal.MustFromString("5"), testNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AddFundingPnL(decimal.MustFromString("3"), testNow); err != nil {
+		t.Fatal(err)
+	}
 	snap := p.Snapshot()
 	if !snap.RealisedPnL.Equal(decimal.MustFromString("15")) {
 		t.Errorf("realised = %s, want 15", snap.RealisedPnL.String())
@@ -198,16 +304,27 @@ func TestPnLAccumulation(t *testing.T) {
 	}
 }
 
-// TestSnapshotIsCopy — mutation снимка не влияет на позицию.
+// TestSnapshotIsCopy — мутация снимка не влияет на оригинальную позицию.
 func TestSnapshotIsCopy(t *testing.T) {
 	p := newPos()
-	p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("50"), testNow)
+	if err := p.SetQuantities(decimal.MustFromString("50"), decimal.MustFromString("50"), testNow); err != nil {
+		t.Fatal(err)
+	}
 	s := p.Snapshot()
+	// Мутируем поля снимка.
 	s.LongBaseQty = decimal.FromInt(999)
-	if p.DeltaBase().IsZero() {
-		// Оригинал не изменился.
-	} else {
-		t.Error("snapshot mutation affected position")
+	s.ShortBaseQty = decimal.FromInt(999)
+
+	// Проверяем, что поля оригинальной позиции не изменились.
+	if !p.LongBaseQty.Equal(decimal.MustFromString("50")) {
+		t.Errorf("original LongBaseQty = %s after snapshot mutation, want 50", p.LongBaseQty.String())
+	}
+	if !p.ShortBaseQty.Equal(decimal.MustFromString("50")) {
+		t.Errorf("original ShortBaseQty = %s after snapshot mutation, want 50", p.ShortBaseQty.String())
+	}
+	// Дельта оригинала по-прежнему ноль.
+	if !p.DeltaBase().IsZero() {
+		t.Errorf("original delta = %s after snapshot mutation, want 0", p.DeltaBase().String())
 	}
 }
 

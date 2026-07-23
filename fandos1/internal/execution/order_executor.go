@@ -33,17 +33,17 @@ func NewOrderExecutor(adapter exchange.ExchangeAdapter, ackTimeout time.Duration
 
 // PlaceOrderResult — исход размещения с учётом QUERY_THEN_DECIDE.
 type PlaceOrderResult struct {
-	Order    domain.Order
-	Source   ResultSource // откуда получено состояние ордера
-	Err      error        // ненулевая при критической ошибке (без состояния)
+	Order  domain.Order
+	Source ResultSource // откуда получено состояние ордера
+	Err    error        // ненулевая при критической ошибке (без состояния)
 }
 
 // ResultSource — источник состояния ордера.
 type ResultSource string
 
 const (
-	SourceAck    ResultSource = "ack"    // штатный ack от биржи
-	SourceQuery  ResultSource = "query"  // восстановлено через GetOrder после ack timeout
+	SourceAck   ResultSource = "ack"   // штатный ack от биржи
+	SourceQuery ResultSource = "query" // восстановлено через GetOrder после ack timeout
 )
 
 // Place размещает ордер с QUERY_THEN_DECIDE-логикой.
@@ -63,26 +63,41 @@ func (e *OrderExecutor) Place(ctx context.Context, req domain.PlaceOrderRequest)
 		// где ack = «принят», а fill details приходят в private WS или через query.
 		// Пробуем получить детали; если GetOrder недоступен сразу — используем ack как есть.
 		order := domain.Order{
-			ExchangeOrderID: ack.ExchangeOrderID,
-			ClientOrderID:   ack.ClientOrderID,
-			Symbol:          req.Symbol,
-			Side:            req.Side,
-			OrderMode:       req.OrderMode,
-			ReduceOnly:      req.ReduceOnly,
-			RequestedQty:    req.BaseQty,
-			Status:          ack.Status,
+			ExchangeOrderID:   ack.ExchangeOrderID,
+			ClientOrderID:     ack.ClientOrderID,
+			Symbol:            req.Symbol,
+			Side:              req.Side,
+			OrderMode:         req.OrderMode,
+			ReduceOnly:        req.ReduceOnly,
+			RequestedQty:      req.BaseQty,
+			Status:            ack.Status,
 			ExchangeTimestamp: ack.Timestamp,
-			AckState:        domain.AckStateAcked,
+			AckState:          domain.AckStateAcked,
 		}
-		// Best-effort query для fill details. Не блокируем на ошибке: ack уже подтверждает принятие.
-		if q, qerr := e.adapter.GetOrder(ctx, domain.OrderQuery{
+		// Best-effort query для fill details. Используем отдельный таймаут e.timeout,
+		// производный от родительского ctx (если родитель уже отменён — query просто
+		// не выполняется и мы сохраняем ack-данные — это допустимое поведение).
+		queryCtx, queryCancel := context.WithTimeout(ctx, e.timeout)
+		q, qerr := e.adapter.GetOrder(queryCtx, domain.OrderQuery{
 			ClientOrderID: req.ClientOrderID,
 			Symbol:        req.Symbol,
-		}); qerr == nil {
+		})
+		queryCancel()
+		if qerr == nil {
 			order.FilledQty = q.FilledQty
 			order.AvgFillPrice = q.AvgFillPrice
 			order.Fees = q.Fees
 			// Статус из query может быть «свежее» (filled vs acknowledged).
+			// Если query вернул терминально-негативный статус (cancelled/rejected/expired)
+			// при успешном ack — фиксируем Source=SourceQuery, чтобы вызывающий знал,
+			// что состояние получено из query, а не из ack (ack и query противоречат друг другу).
+			if isTerminalNegative(q.Status) {
+				order.Status = q.Status
+				return PlaceOrderResult{
+					Order:  order,
+					Source: SourceQuery, // состояние из query, противоречащего ack
+				}, nil
+			}
 			order.Status = q.Status
 		}
 		return PlaceOrderResult{Order: order, Source: SourceAck}, nil
@@ -139,4 +154,13 @@ func IsAmbiguousTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isTerminalNegative — true для статусов, означающих, что ордер не был исполнен:
+// cancelled, rejected, expired. Используется для обнаружения противоречия между
+// успешным ack и последующим query, возвращающим негативный терминальный статус.
+func isTerminalNegative(s domain.OrderStatus) bool {
+	return s == domain.OrderStatusCancelled ||
+		s == domain.OrderStatusRejected ||
+		s == domain.OrderStatusExpired
 }

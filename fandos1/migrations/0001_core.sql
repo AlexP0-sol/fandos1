@@ -73,24 +73,37 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX ON audit_log (occurred_at);
 CREATE INDEX ON audit_log (correlation_id);
+-- Индекс для фильтрации/поиска по актору с сортировкой по времени.
+CREATE INDEX ON audit_log (actor, occurred_at DESC);
 
 -- Transactional outbox (15.2).
+-- topic — маршрутизация диспетчером; attempts/last_error/next_retry_at — для retry-логики.
 CREATE TABLE outbox_events (
-    event_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    kind         TEXT NOT NULL,
-    payload      JSONB NOT NULL,
-    processed_at TIMESTAMPTZ
+    event_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    topic          TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    payload        JSONB NOT NULL,
+    processed_at   TIMESTAMPTZ,
+    attempts       SMALLINT NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    next_retry_at  TIMESTAMPTZ
 );
+-- Индекс для диспетчера: только необработанные события.
 CREATE INDEX ON outbox_events (processed_at) WHERE processed_at IS NULL;
+-- Индекс для диспетчера: упорядочивание необработанных событий по времени создания.
+CREATE INDEX ON outbox_events (created_at) WHERE processed_at IS NULL;
 
 -- Idempotency мутаций UI→backend (13.5) и внешних операций.
+-- expires_at — обязателен: позволяет GC-задаче удалять устаревшие ключи.
 CREATE TABLE idempotency_keys (
     idem_key    TEXT PRIMARY KEY,
     scope       TEXT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
     result_hash TEXT
 );
+CREATE INDEX ON idempotency_keys (expires_at);
 
 CREATE TABLE incidents (
     incident_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -100,6 +113,8 @@ CREATE TABLE incidents (
     opened_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at  TIMESTAMPTZ
 );
+-- Частичный индекс: только открытые инциденты, для быстрого поиска по важности.
+CREATE INDEX ON incidents (severity, opened_at DESC) WHERE resolved_at IS NULL;
 
 -- Раздел 24: состояние clock sync.
 CREATE TABLE clock_sync_state (
@@ -110,18 +125,22 @@ CREATE TABLE clock_sync_state (
 );
 
 -- Раздел 27: журнал ротаций/kill switch.
+-- CHECK: KILL_SWITCH может не иметь credential_id (отзыв всех ключей), остальные — обязан.
 CREATE TABLE key_rotation_log (
-    rotation_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rotation_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     credential_id BIGINT REFERENCES exchange_credentials(credential_id),
-    action       TEXT NOT NULL CHECK (action IN ('PLANNED_ROTATION','EMERGENCY_ROTATION','KILL_SWITCH')),
-    initiator    TEXT NOT NULL,
-    occurred_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    details      JSONB
+    action        TEXT NOT NULL CHECK (action IN ('PLANNED_ROTATION','EMERGENCY_ROTATION','KILL_SWITCH')),
+    initiator     TEXT NOT NULL,
+    occurred_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    details       JSONB,
+    CHECK ((action = 'KILL_SWITCH') OR (credential_id IS NOT NULL))
 );
 
 -- Seed: ровно один владелец (критерий приёмки ADR-0001).
--- telegram_id=0 — placeholder; первичная привязка владельца (setup) обновит его.
-INSERT INTO users (tenant_id, telegram_id) VALUES ('default', 0) ON CONFLICT DO NOTHING;
+-- ВАЖНО: telegram_id=-1 — запрещённый placeholder.
+-- Приложение ОБЯЗАНО отказаться торговать, пока owner telegram_id < 1
+-- (startup precondition, проверяется приложением при инициализации).
+INSERT INTO users (tenant_id, telegram_id) VALUES ('default', -1) ON CONFLICT DO NOTHING;
 INSERT INTO system_locks (lock_name, engaged) VALUES
  ('SAFE_HALT', FALSE), ('TRADING_LOCKED', FALSE), ('REBALANCE_LOCKED', FALSE)
  ON CONFLICT (lock_name) DO NOTHING;

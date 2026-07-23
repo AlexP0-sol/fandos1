@@ -26,20 +26,20 @@ import (
 type State string
 
 const (
-	StateDiscovered          State = "DISCOVERED"
-	StateQualified           State = "QUALIFIED"
-	StateAwaitingApproval    State = "AWAITING_USER_APPROVAL"
-	StatePreparing           State = "PREPARING"
-	StateOpening             State = "OPENING"
-	StatePartiallyHedged     State = "PARTIALLY_HEDGED"
-	StateHedged              State = "HEDGED"
-	StateMonitoring          State = "MONITORING"
-	StateExitRequested       State = "EXIT_REQUESTED"
-	StateExiting             State = "EXITING"
-	StateReconciling         State = "RECONCILING"
-	StateClosed              State = "CLOSED"
-	StateDegraded            State = "DEGRADED"
-	StateFailed              State = "FAILED"
+	StateDiscovered       State = "DISCOVERED"
+	StateQualified        State = "QUALIFIED"
+	StateAwaitingApproval State = "AWAITING_USER_APPROVAL"
+	StatePreparing        State = "PREPARING"
+	StateOpening          State = "OPENING"
+	StatePartiallyHedged  State = "PARTIALLY_HEDGED"
+	StateHedged           State = "HEDGED"
+	StateMonitoring       State = "MONITORING"
+	StateExitRequested    State = "EXIT_REQUESTED"
+	StateExiting          State = "EXITING"
+	StateReconciling      State = "RECONCILING"
+	StateClosed           State = "CLOSED"
+	StateDegraded         State = "DEGRADED"
+	StateFailed           State = "FAILED"
 )
 
 // IsTerminal — true для финальных состояний (позиция неактивна).
@@ -96,8 +96,8 @@ var allowedTransitions = map[State]map[State]bool{
 		StateExitRequested: true, StateReconciling: true, StateFailed: true, StateClosed: true,
 	},
 	// Terminal: никаких переходов.
-	StateClosed:   {},
-	StateFailed:   {},
+	StateClosed: {},
+	StateFailed: {},
 }
 
 // CanTransition — true, если переход from→to разрешён таблицей.
@@ -114,6 +114,12 @@ var ErrInvalidTransition = errors.New("portfolio: invalid state transition")
 // ErrPositionTerminal — позиция уже в финальном состоянии.
 var ErrPositionTerminal = errors.New("portfolio: position is in terminal state")
 
+// ErrPersistInProgress — персистенция перехода уже идёт; вызывающий должен повторить позже.
+var ErrPersistInProgress = errors.New("portfolio: persist in progress")
+
+// ErrPositionTerminalMutation — попытка изменить терминальную позицию.
+var ErrPositionTerminalMutation = errors.New("portfolio: cannot mutate terminal position")
+
 // ============================================================
 // Position (доменный агрегат)
 // ============================================================
@@ -127,8 +133,8 @@ type Position struct {
 	LongExchange  domain.ExchangeID
 	ShortExchange domain.ExchangeID
 
-	State         State
-	EntryReason   string
+	State       State
+	EntryReason string
 
 	// Target / actual quantities.
 	TargetBaseQty decimal.Decimal
@@ -136,27 +142,31 @@ type Position struct {
 	ShortBaseQty  decimal.Decimal // abs
 
 	// PnL accumulators.
-	RealisedPnL   decimal.Decimal
-	FundingPnL    decimal.Decimal
-	FeesPaid      decimal.Decimal
+	RealisedPnL decimal.Decimal
+	FundingPnL  decimal.Decimal
+	FeesPaid    decimal.Decimal
 
 	// Timestamps.
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	ExitReason    string
-	ExitedAt      *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	ExitReason string
+	ExitedAt   *time.Time
 
 	// History of transitions (in-memory audit; персистируется в БД через Persister callback).
 	History []Transition
+
+	// persisting — защита от TOCTOU: если true, персистенция уже в процессе,
+	// новые переходы блокируются через ErrPersistInProgress.
+	persisting bool
 }
 
 // Transition — запись одного перехода.
 type Transition struct {
-	From      State
-	To        State
-	At        time.Time
-	Reason    string
-	Actor     string // "system:scanner" / "user" / "system:risk"
+	From   State
+	To     State
+	At     time.Time
+	Reason string
+	Actor  string // "system:scanner" / "user" / "system:risk"
 }
 
 // Persister — callback для персистентной записи перехода в БД + audit log.
@@ -195,6 +205,7 @@ func (p *Position) IsTerminal() bool {
 
 // TransitionTo выполняет переход в новое состояние.
 // Возвращает ErrInvalidTransition, если переход неразрешён; ErrPositionTerminal, если уже финально.
+// ErrPersistInProgress, если параллельный вызов уже выполняет персистенцию (TOCTOU-защита).
 // now передаётся для тестируемости. reason/actor — для audit.
 // Если persister не nil и возвращает ошибку — переход откатывается, ошибка возвращается.
 func (p *Position) TransitionTo(to State, now time.Time, reason, actor string, persister Persister) error {
@@ -204,11 +215,17 @@ func (p *Position) TransitionTo(to State, now time.Time, reason, actor string, p
 		p.mu.Unlock()
 		return ErrPositionTerminal
 	}
+	// TOCTOU: если персистенция уже в процессе — отказываем.
+	if p.persisting {
+		p.mu.Unlock()
+		return ErrPersistInProgress
+	}
 	if !CanTransition(from, to) {
 		p.mu.Unlock()
 		return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, from, to)
 	}
-	// Применяем переход.
+	// Фиксируем переход и блокируем параллельные вызовы на время персистенции.
+	p.persisting = true
 	p.State = to
 	p.UpdatedAt = now
 	t := Transition{From: from, To: to, At: now, Reason: reason, Actor: actor}
@@ -226,20 +243,30 @@ func (p *Position) TransitionTo(to State, now time.Time, reason, actor string, p
 			if len(p.History) > 0 {
 				p.History = p.History[:len(p.History)-1]
 			}
+			p.persisting = false
 			p.mu.Unlock()
 			return fmt.Errorf("portfolio: persist transition failed: %w", err)
 		}
 	}
+
+	p.mu.Lock()
+	p.persisting = false
+	p.mu.Unlock()
 	return nil
 }
 
 // SetQuantities — обновляет фактические quantities после исполнения (например, после slice).
-func (p *Position) SetQuantities(long, short decimal.Decimal, now time.Time) {
+// Возвращает ErrPositionTerminalMutation при попытке изменить терминальную позицию.
+func (p *Position) SetQuantities(long, short decimal.Decimal, now time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.State.IsTerminal() {
+		return ErrPositionTerminalMutation
+	}
 	p.LongBaseQty = long
 	p.ShortBaseQty = short
 	p.UpdatedAt = now
+	return nil
 }
 
 // DeltaBase — дельта по базовому активу (раздел 3.5):
@@ -252,19 +279,29 @@ func (p *Position) DeltaBase() decimal.Decimal {
 }
 
 // AddRealisedPnL — добавляет реализованный PnL (после закрытия/частичного закрытия).
-func (p *Position) AddRealisedPnL(amount decimal.Decimal, now time.Time) {
+// Возвращает ErrPositionTerminalMutation при попытке изменить терминальную позицию.
+func (p *Position) AddRealisedPnL(amount decimal.Decimal, now time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.State.IsTerminal() {
+		return ErrPositionTerminalMutation
+	}
 	p.RealisedPnL = p.RealisedPnL.Add(amount)
 	p.UpdatedAt = now
+	return nil
 }
 
 // AddFundingPnL — добавляет подтверждённый funding PnL (раздел 3.2).
-func (p *Position) AddFundingPnL(amount decimal.Decimal, now time.Time) {
+// Возвращает ErrPositionTerminalMutation при попытке изменить терминальную позицию.
+func (p *Position) AddFundingPnL(amount decimal.Decimal, now time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.State.IsTerminal() {
+		return ErrPositionTerminalMutation
+	}
 	p.FundingPnL = p.FundingPnL.Add(amount)
 	p.UpdatedAt = now
+	return nil
 }
 
 // Snapshot возвращает безопасную копию позиции для UI/логов (без mutex).
@@ -292,7 +329,7 @@ func (p *Position) Snapshot() Snapshot {
 	return Snapshot{
 		ID: p.ID, Asset: p.Asset,
 		LongExchange: p.LongExchange, ShortExchange: p.ShortExchange,
-		State: p.State,
+		State:         p.State,
 		TargetBaseQty: p.TargetBaseQty,
 		LongBaseQty:   p.LongBaseQty, ShortBaseQty: p.ShortBaseQty,
 		RealisedPnL: p.RealisedPnL, FundingPnL: p.FundingPnL, FeesPaid: p.FeesPaid,

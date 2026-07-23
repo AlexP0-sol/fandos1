@@ -1,0 +1,25 @@
+# Binaries
+/fandos1/bin/
+*.exe
+*.test
+*.out
+
+# Go build/test cache artifacts
+/fandos1/coverage.html
+coverage.txt
+*.coverprofile
+
+# Env / secrets — НИКОГДА не коммитить
+.env
+.env.*
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

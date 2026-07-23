@@ -23,11 +23,11 @@ func setupFixture(t *testing.T) (*instrument.Registry, *marketdata.Cache) {
 	now := time.Now()
 	// Binance: mark=100, predicted funding=0.0001, ask depth достаточна.
 	cache.Update(&domain.MarketSnapshot{
-		Exchange:           domain.ExchangeBinance,
-		CanonicalBaseAsset: "BTC",
-		BestAsk:            decimal.MustFromString("100"),
-		BestBid:            decimal.MustFromString("99.5"),
-		MarkPrice:          decimal.MustFromString("100"),
+		Exchange:             domain.ExchangeBinance,
+		CanonicalBaseAsset:   "BTC",
+		BestAsk:              decimal.MustFromString("100"),
+		BestBid:              decimal.MustFromString("99.5"),
+		MarkPrice:            decimal.MustFromString("100"),
 		PredictedFundingRate: decimal.MustFromString("0.0001"),
 		FundingIntervalSec:   28800,
 		NextFundingTime:      now.Add(2 * time.Hour),
@@ -35,17 +35,17 @@ func setupFixture(t *testing.T) (*instrument.Registry, *marketdata.Cache) {
 		QuoteVolume24h:       decimal.MustFromString("1000000"),
 		AskDepthForTargetQty: decimal.MustFromString("50000"),
 		BidDepthForTargetQty: decimal.MustFromString("50000"),
-		IsFresh:             true,
-		SequenceValid:       true,
-		LocalReceiveTime:    now,
+		IsFresh:              true,
+		SequenceValid:        true,
+		LocalReceiveTime:     now,
 	})
 	// Bybit: mark=101 (выше), funding больше 0.0003 → short получает больше.
 	cache.Update(&domain.MarketSnapshot{
-		Exchange:           domain.ExchangeBybit,
-		CanonicalBaseAsset: "BTC",
-		BestAsk:            decimal.MustFromString("101"),
-		BestBid:            decimal.MustFromString("100.5"),
-		MarkPrice:          decimal.MustFromString("101"),
+		Exchange:             domain.ExchangeBybit,
+		CanonicalBaseAsset:   "BTC",
+		BestAsk:              decimal.MustFromString("101"),
+		BestBid:              decimal.MustFromString("100.5"),
+		MarkPrice:            decimal.MustFromString("101"),
 		PredictedFundingRate: decimal.MustFromString("0.0003"),
 		FundingIntervalSec:   28800,
 		NextFundingTime:      now.Add(2 * time.Hour),
@@ -53,9 +53,9 @@ func setupFixture(t *testing.T) (*instrument.Registry, *marketdata.Cache) {
 		QuoteVolume24h:       decimal.MustFromString("1000000"),
 		AskDepthForTargetQty: decimal.MustFromString("50000"),
 		BidDepthForTargetQty: decimal.MustFromString("50000"),
-		IsFresh:             true,
-		SequenceValid:       true,
-		LocalReceiveTime:    now,
+		IsFresh:              true,
+		SequenceValid:        true,
+		LocalReceiveTime:     now,
 	})
 	return reg, cache
 }
@@ -167,18 +167,18 @@ func TestScanFiltersLowVolume(t *testing.T) {
 	reg, cache := setupFixture(t)
 	// Снижаем volume Bybit.
 	cache.Update(&domain.MarketSnapshot{
-		Exchange:           domain.ExchangeBybit,
-		CanonicalBaseAsset: "BTC",
-		BestAsk:            decimal.MustFromString("101"),
-		BestBid:            decimal.MustFromString("100.5"),
-		MarkPrice:          decimal.MustFromString("101"),
-		QuoteVolume24h:     decimal.MustFromString("1000"), // ниже порога
+		Exchange:             domain.ExchangeBybit,
+		CanonicalBaseAsset:   "BTC",
+		BestAsk:              decimal.MustFromString("101"),
+		BestBid:              decimal.MustFromString("100.5"),
+		MarkPrice:            decimal.MustFromString("101"),
+		QuoteVolume24h:       decimal.MustFromString("1000"), // ниже порога
 		AskDepthForTargetQty: decimal.MustFromString("50000"),
 		BidDepthForTargetQty: decimal.MustFromString("50000"),
-		IsFresh:           true,
-		SequenceValid:     true,
-		LocalReceiveTime:  time.Now(),
-		FundingConfidence: domain.ConfidenceHigh,
+		IsFresh:              true,
+		SequenceValid:        true,
+		LocalReceiveTime:     time.Now(),
+		FundingConfidence:    domain.ConfidenceHigh,
 	})
 	s := New(reg, cache)
 	cands := s.Scan(baseConfig(time.Now()), time.Now())

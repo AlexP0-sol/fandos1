@@ -1,6 +1,6 @@
 // Package orderbook реализует расчёт VWAP по стакану для целевого объёма (раздел 3.3 промпта v2).
 //
-// VWAP — средневзвешенная цена исполнения, когда целевой объём «прходит» через уровни стакана.
+// VWAP — средневзвешенная цена исполнения, когда целевой объём проходит через уровни стакана.
 // В отличие от BBO (best bid/ask), VWAP отражает реальную стоимость входа/выхода с учётом глубины,
 // что критично для оценки EntryBasis и slippage (раздел 3.3).
 package orderbook
@@ -22,7 +22,7 @@ type VWAPResult struct {
 	FullyFilled bool
 }
 
-// AbsBestPrice возвращает абсолютное отклонение VWAP от лучшей цены стакана.
+// SlippageBps возвращает отклонение VWAP от лучшей цены стакана в базисных пунктах.
 // Полезно для оценки slippage: чем больше отклонение, тем хуже цена входа.
 func (r VWAPResult) SlippageBps(bestPrice decimal.Decimal) decimal.Decimal {
 	if r.VWAP.IsZero() || bestPrice.IsZero() {
@@ -36,6 +36,9 @@ func (r VWAPResult) SlippageBps(bestPrice decimal.Decimal) decimal.Decimal {
 // VWAPBuy — стоимость покупки заданного объёма через asks (возрастающие цены).
 // Сторона long: берём asks от лучшего (минимального) вверх.
 //
+// ПРЕДУСЛОВИЕ: asks должны быть отсортированы по возрастанию цены.
+// Несортированный ввод даёт неверный VWAP без диагностики.
+//
 // Логика: для каждого уровня берём min(доступный объём уровня, остаток запроса),
 // накапливаем Σ(qty × price) и Σqty. Если вся глубина исчерпана до заполнения объёма —
 // FilledQty < requested, FullyFilled=false (раздел 8.1: insufficient depth → кандидат отбрасывается).
@@ -48,8 +51,11 @@ func VWAPBuy(asks []domain.PriceLevel, requestedQty decimal.Decimal) VWAPResult 
 
 // VWAPSell — стоимость продажи заданного объёма через bids (убывающие цены).
 // Сторона short: берём bids от лучшего (максимального) вниз.
+//
+// ПРЕДУСЛОВИЕ: bids должны быть отсортированы по убыванию цены.
+// Несортированный ввод даёт неверный VWAP без диагностики.
 func VWAPSell(bids []domain.PriceLevel, requestedQty decimal.Decimal) VWAPResult {
-	if requestedQty.IsZero() || requestedQty.IsNegative() || len(bids) == 0 {
+	if !requestedQty.IsPositive() || len(bids) == 0 {
 		return VWAPResult{}
 	}
 	return walk(bids, requestedQty)
@@ -66,6 +72,10 @@ func walk(levels []domain.PriceLevel, requestedQty decimal.Decimal) VWAPResult {
 	for _, lvl := range levels {
 		if remaining.IsZero() {
 			break
+		}
+		// Пропускаем уровни с нулевым или отрицательным объёмом.
+		if !lvl.Qty.IsPositive() {
+			continue
 		}
 		// Сколько можно взять с этого уровня.
 		take := lvl.Qty

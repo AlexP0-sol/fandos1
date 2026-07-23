@@ -93,11 +93,11 @@ type PublicSubscription struct {
 type Channel string
 
 const (
-	ChannelTicker   Channel = "ticker"
-	ChannelBBO      Channel = "bbo"
-	ChannelDepth    Channel = "depth"
+	ChannelTicker    Channel = "ticker"
+	ChannelBBO       Channel = "bbo"
+	ChannelDepth     Channel = "depth"
 	ChannelMarkPrice Channel = "mark_price"
-	ChannelFunding  Channel = "funding"
+	ChannelFunding   Channel = "funding"
 )
 
 // PublicEvent — нормализованное публичное WS-событие.
@@ -116,12 +116,12 @@ type PublicEvent struct {
 // Приватные события нельзя терять; вызывающий обязан обрабатывать упорядоченно
 // и сверять с REST при сомнении (раздел 7.3).
 type PrivateEvent struct {
-	Kind     PrivateEventKind
-	Order    *domain.Order
-	Fill     *Fill
-	Position *domain.Position
-	Balance  *domain.Balance
-	Funding  *FundingPayment
+	Kind       PrivateEventKind
+	Order      *domain.Order
+	Fill       *Fill
+	Position   *domain.Position
+	Balance    *domain.Balance
+	Funding    *FundingPayment
 	ExchangeTS time.Time
 	ReceivedAt time.Time
 }
@@ -153,11 +153,11 @@ type Fill struct {
 
 // FundingPayment — фактически начисленный funding (подтверждение, раздел 3.2).
 type FundingPayment struct {
-	Symbol       domain.ExchangeSymbol
-	Amount       decimal.Decimal // со знаком: + получено, - уплачено
-	Rate         decimal.Decimal
-	Notional     decimal.Decimal
-	FundingTime  time.Time
+	Symbol      domain.ExchangeSymbol
+	Amount      decimal.Decimal // со знаком: + получено, - уплачено
+	Rate        decimal.Decimal
+	Notional    decimal.Decimal
+	FundingTime time.Time
 }
 
 // ============================================================

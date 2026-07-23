@@ -21,28 +21,28 @@ import (
 type Mock struct {
 	id domain.ExchangeID
 
-	mu       sync.Mutex
+	mu          sync.Mutex
 	instruments []domain.CanonicalInstrument
-	books      map[domain.ExchangeSymbol]*orderBookState
-	orders     map[string]*domain.Order // keyed by client order id
-	fillRules  map[domain.ExchangeSymbol]FillRule
-	positions  []domain.Position
-	balances   []domain.Balance
-	adlStates  map[domain.ExchangeSymbol]domain.ADLState
-	serverTime time.Time
+	books       map[domain.ExchangeSymbol]*orderBookState
+	orders      map[string]*domain.Order // keyed by client order id
+	fillRules   map[domain.ExchangeSymbol]FillRule
+	positions   []domain.Position
+	balances    []domain.Balance
+	adlStates   map[domain.ExchangeSymbol]domain.ADLState
+	serverTime  time.Time
 
 	// Поведенческие флаги
 	ackTimeoutSymbols map[domain.ExchangeSymbol]bool // символы, чьи PlaceOrder не отвечают (ack timeout)
-	rejectNext        int                              // счётчик: отклонить следующие N order placements
-	networkErrors     int                              // сетевые ошибки до успеха
-	latency           time.Duration                    // искусственная задержка ответов
+	rejectNext        int                            // счётчик: отклонить следующие N order placements
+	networkErrors     int                            // сетевые ошибки до успеха
+	latency           time.Duration                  // искусственная задержка ответов
 	withdrawSuspended bool
 	rateLimited       bool
 
 	// WS
-	publicCh  chan exchange.PublicEvent
-	privateCh chan exchange.PrivateEvent
-	publicSubs  []exchange.PublicSubscription
+	publicCh   chan exchange.PublicEvent
+	privateCh  chan exchange.PrivateEvent
+	publicSubs []exchange.PublicSubscription
 }
 
 // New создаёт mock биржу с заданным id.
@@ -140,13 +140,34 @@ func (m *Mock) SetRateLimited(v bool) {
 	m.rateLimited = v
 }
 
+// SetRejectNext задаёт счётчик: следующие n PlaceOrder вернут биржевой reject.
+// Счётчик уменьшается под mutex при каждом срабатывании.
+func (m *Mock) SetRejectNext(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rejectNext = n
+}
+
+// SetNetworkErrors задаёт счётчик: следующие n PlaceOrder вернут exchange.ErrNetwork.
+// Счётчик уменьшается под mutex при каждом срабатывании.
+func (m *Mock) SetNetworkErrors(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.networkErrors = n
+}
+
 // ============================================================
 // ExchangeAdapter реализация
 // ============================================================
 
 func (m *Mock) GetServerTime(ctx context.Context) (time.Time, error) {
-	m.sleepLatency()
-	return m.serverTime, nil
+	if err := m.guard(); err != nil {
+		return time.Time{}, err
+	}
+	m.mu.Lock()
+	t := m.serverTime
+	m.mu.Unlock()
+	return t, nil
 }
 
 func (m *Mock) GetInstruments(ctx context.Context) ([]domain.CanonicalInstrument, error) {
@@ -210,17 +231,30 @@ func (m *Mock) GetOrderBookSnapshot(ctx context.Context, sym domain.ExchangeSymb
 	}, nil
 }
 
+// SubscribePublic подписывается на публичные каналы.
+// При повторном вызове закрывает ранее возвращённый канал перед заменой,
+// чтобы читатель мог обнаружить разрыв.
 func (m *Mock) SubscribePublic(ctx context.Context, subs []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Закрываем старый канал, если был.
+	if m.publicCh != nil {
+		close(m.publicCh)
+	}
 	m.publicSubs = subs
 	m.publicCh = make(chan exchange.PublicEvent, 128)
 	return m.publicCh, nil
 }
 
+// SubscribePrivate подписывается на приватные каналы.
+// При повторном вызове закрывает ранее возвращённый канал перед заменой.
 func (m *Mock) SubscribePrivate(ctx context.Context, cred domain.CredentialRef) (<-chan exchange.PrivateEvent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Закрываем старый канал, если был.
+	if m.privateCh != nil {
+		close(m.privateCh)
+	}
 	m.privateCh = make(chan exchange.PrivateEvent, 128)
 	return m.privateCh, nil
 }
@@ -308,21 +342,51 @@ func (m *Mock) PlaceOrder(ctx context.Context, req domain.PlaceOrderRequest) (do
 	}
 
 	m.mu.Lock()
+
+	// Проверяем и декрементируем счётчик сетевых ошибок.
+	if m.networkErrors > 0 {
+		m.networkErrors--
+		m.mu.Unlock()
+		return domain.OrderAck{}, exchange.ErrNetwork
+	}
+
+	// Проверяем и декрементируем счётчик биржевых reject.
+	doReject := false
+	if m.rejectNext > 0 {
+		m.rejectNext--
+		doReject = true
+	}
+
 	rule, hasRule := m.fillRules[req.Symbol]
 	ackTimeout := m.ackTimeoutSymbols[req.Symbol]
+	serverTime := m.serverTime
 	m.mu.Unlock()
 
 	// Ордер создаётся ВСЕГДА (даже при reject/ack-timeout), чтобы GetOrder его нашёл.
 	o := &domain.Order{
-		ClientOrderID:    req.ClientOrderID,
-		Symbol:           req.Symbol,
-		Side:             req.Side,
-		OrderMode:        req.OrderMode,
-		ReduceOnly:       req.ReduceOnly,
-		RequestedQty:     req.BaseQty,
-		Status:           domain.OrderStatusNew,
-		ExchangeTimestamp: m.serverTime,
-		ExchangeOrderID:  fmt.Sprintf("%s-%d", req.ClientOrderID, m.serverTime.UnixNano()),
+		ClientOrderID:     req.ClientOrderID,
+		Symbol:            req.Symbol,
+		Side:              req.Side,
+		OrderMode:         req.OrderMode,
+		ReduceOnly:        req.ReduceOnly,
+		RequestedQty:      req.BaseQty,
+		Status:            domain.OrderStatusNew,
+		ExchangeTimestamp: serverTime,
+		ExchangeOrderID:   fmt.Sprintf("%s-%d", req.ClientOrderID, serverTime.UnixNano()),
+	}
+
+	// SetRejectNext имеет приоритет над FillRule.
+	if doReject {
+		o.Status = domain.OrderStatusRejected
+		m.mu.Lock()
+		m.orders[string(req.ClientOrderID)] = o
+		m.mu.Unlock()
+		return domain.OrderAck{
+			ExchangeOrderID: o.ExchangeOrderID,
+			ClientOrderID:   req.ClientOrderID,
+			Status:          o.Status,
+			Timestamp:       serverTime,
+		}, nil
 	}
 
 	// Determine fill fraction.
@@ -333,15 +397,21 @@ func (m *Mock) PlaceOrder(ctx context.Context, req domain.PlaceOrderRequest) (do
 	o.FilledQty = req.BaseQty.Mul(frac)
 	if req.Price.GreaterThan(decimal.Zero) {
 		o.AvgFillPrice = req.Price
-	} else if b, ok := m.bookFor(req.Symbol); ok {
-		if req.Side == domain.SideLong && len(b.asks) > 0 {
-			o.AvgFillPrice = b.asks[0].Price
-		} else if req.Side == domain.SideShort && len(b.bids) > 0 {
-			o.AvgFillPrice = b.bids[0].Price
+	} else {
+		// Читаем книгу под блокировкой.
+		m.mu.Lock()
+		b, ok := m.books[req.Symbol]
+		if ok {
+			if req.Side == domain.SideLong && len(b.asks) > 0 {
+				o.AvgFillPrice = b.asks[0].Price
+			} else if req.Side == domain.SideShort && len(b.bids) > 0 {
+				o.AvgFillPrice = b.bids[0].Price
+			}
 		}
+		m.mu.Unlock()
 	}
 
-	// Reject scenario: ордер создан, но отвергнут.
+	// Reject scenario из FillRule: ордер создан, но отвергнут.
 	if hasRule && rule.Reject {
 		o.Status = domain.OrderStatusRejected
 	} else if o.FilledQty.IsZero() {
@@ -366,7 +436,7 @@ func (m *Mock) PlaceOrder(ctx context.Context, req domain.PlaceOrderRequest) (do
 		ExchangeOrderID: o.ExchangeOrderID,
 		ClientOrderID:   req.ClientOrderID,
 		Status:          o.Status,
-		Timestamp:       m.serverTime,
+		Timestamp:       serverTime,
 	}, nil
 }
 
@@ -400,6 +470,9 @@ func (m *Mock) GetOrder(ctx context.Context, req domain.OrderQuery) (domain.Orde
 }
 
 func (m *Mock) GetADLState(ctx context.Context, sym domain.ExchangeSymbol) (domain.ADLState, error) {
+	if err := m.guard(); err != nil {
+		return domain.ADLState{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.adlStates[sym]
@@ -446,26 +519,20 @@ func (m *Mock) GetNetworkInfo(ctx context.Context, asset string) ([]domain.Netwo
 // ============================================================
 
 // guard проверяет rate-limit/network флаги.
+// Задержку latency копирует под блокировкой и спит ВНЕ блокировки.
 func (m *Mock) guard() error {
-	m.sleepLatency()
 	m.mu.Lock()
+	lat := m.latency
 	rl := m.rateLimited
 	m.mu.Unlock()
+	// Спим вне блокировки.
+	if lat > 0 {
+		time.Sleep(lat)
+	}
 	if rl {
 		return exchange.ErrRateLimited
 	}
 	return nil
-}
-
-func (m *Mock) sleepLatency() {
-	if m.latency > 0 {
-		time.Sleep(m.latency)
-	}
-}
-
-func (m *Mock) bookFor(sym domain.ExchangeSymbol) (*orderBookState, bool) {
-	b, ok := m.books[sym]
-	return b, ok
 }
 
 func cloneLevels(src []domain.PriceLevel, depth int) []domain.PriceLevel {

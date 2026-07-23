@@ -2,7 +2,7 @@
 //
 // Кэш хранит только ПОСЛЕДНЕЕ состояние каждого символа, а не каждое WS-сообщение.
 // Это реализация coalescing-стратегии: public data можно «схлопывать», сохраняя последнее
-// состояние и считая метрику drops/coalesces для observability (раздел 17.1).
+// состояние и считая метрику replaced (перезаписей) для observability (раздел 17.1).
 //
 // Каждый символ хранится под atomic.Pointer → конкурентное чтение без блокировки в hot path.
 // Update полностью заменяет snapshot (immutable per-update), что соответствует принципу
@@ -25,8 +25,8 @@ type cacheKey struct {
 
 // snapshotEntry — атомарно-обновляемый слот одного символа.
 type snapshotEntry struct {
-	p       atomic.Pointer[domain.MarketSnapshot]
-	coalesced atomic.Int64 // число схлопнутых обновлений (observability)
+	p        atomic.Pointer[domain.MarketSnapshot]
+	replaced atomic.Int64 // число перезаписей (observability): каждый Swap с непустым old
 }
 
 // Cache — thread-safe coalescing-кэш рыночных снимков.
@@ -35,8 +35,8 @@ type Cache struct {
 	entries map[cacheKey]*snapshotEntry
 
 	// Глобальные счётчики для метрик (раздел 17.1).
-	totalUpdates atomic.Int64
-	totalDrops   atomic.Int64
+	totalUpdates  atomic.Int64
+	totalReplaced atomic.Int64 // суммарно перезаписей (overwrites, counts replaced snapshots)
 }
 
 // New создаёт пустой кэш.
@@ -66,8 +66,8 @@ func (c *Cache) getOrCreateEntry(k cacheKey) *snapshotEntry {
 }
 
 // Update заменяет снимок символа. Coalescing: если между вызовами Update никто не успел
-// прочитать, промежуточные значения теряются — это сознательно для public data (раздел 7.3).
-// Каждый вызов инкрементирует coalesced-счётчик, позволяя оценить «плотность» обновлений.
+// прочитать, промежуточные значения перезаписываются — это сознательно для public data (раздел 7.3).
+// Каждая перезапись инкрементирует replaced-счётчик, позволяя оценить «плотность» обновлений.
 func (c *Cache) Update(snap *domain.MarketSnapshot) {
 	if snap == nil {
 		return
@@ -75,10 +75,10 @@ func (c *Cache) Update(snap *domain.MarketSnapshot) {
 	k := cacheKey{exchange: snap.Exchange, asset: snap.CanonicalBaseAsset}
 	e := c.getOrCreateEntry(k)
 
-	// Coalesce: если уже было значение — считаем, что предыдущее «схлопнулось» с новым.
+	// Если уже было значение — это перезапись (overwrite/replace).
 	if old := e.p.Swap(snap); old != nil {
-		e.coalesced.Add(1)
-		c.totalDrops.Add(1)
+		e.replaced.Add(1)
+		c.totalReplaced.Add(1)
 	}
 	c.totalUpdates.Add(1)
 }
@@ -114,6 +114,7 @@ func (c *Cache) IsFresh(exchange domain.ExchangeID, asset domain.AssetSymbol, no
 
 // SnapshotStats — per-symbol статистика для observability.
 type SnapshotStats struct {
+	// CoalescedUpdates — число перезаписей (overwrite): каждая замена непустого снимка.
 	CoalescedUpdates int64
 }
 
@@ -125,13 +126,18 @@ func (c *Cache) StatsOf(exchange domain.ExchangeID, asset domain.AssetSymbol) (S
 	if !ok {
 		return SnapshotStats{}, false
 	}
-	return SnapshotStats{CoalescedUpdates: e.coalesced.Load()}, true
+	return SnapshotStats{CoalescedUpdates: e.replaced.Load()}, true
 }
 
 // GlobalStats — глобальные счётчики кэша.
 type GlobalStats struct {
 	TotalUpdates int64
-	TotalDrops   int64 // суммарно схлопнутых (coalesced) обновлений
+	// TotalReplaced — суммарное число перезаписей (overwrites):
+	// сколько раз Update заменил уже существующий непрочитанный снимок.
+	// Не потери данных, а измеримая интенсивность coalescing.
+	TotalReplaced int64
+	// TotalDrops — устаревший псевдоним TotalReplaced; оставлен для обратной совместимости.
+	TotalDrops     int64
 	TrackedSymbols int
 }
 
@@ -140,9 +146,11 @@ func (c *Cache) Global() GlobalStats {
 	c.mu.RLock()
 	n := len(c.entries)
 	c.mu.RUnlock()
+	replaced := c.totalReplaced.Load()
 	return GlobalStats{
 		TotalUpdates:   c.totalUpdates.Load(),
-		TotalDrops:     c.totalDrops.Load(),
+		TotalReplaced:  replaced,
+		TotalDrops:     replaced, // устаревший псевдоним
 		TrackedSymbols: n,
 	}
 }

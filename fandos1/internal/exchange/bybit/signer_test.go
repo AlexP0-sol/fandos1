@@ -69,38 +69,32 @@ func TestAPIKeyAccessor(t *testing.T) {
 	}
 }
 
-// TestAuthParamsQuery — обязательные параметры собираются в строку.
-func TestAuthParamsQuery(t *testing.T) {
+// TestAuthHeaders — V5 аутентификация через заголовки X-BAPI-*.
+func TestAuthHeaders(t *testing.T) {
 	s := NewSigner("KEY", []byte("s"))
-	q := s.AuthParamsQuery(1650000000000, 5000)
-	want := "api_key=KEY&timestamp=1650000000000&recv_window=5000"
-	if q != want {
-		t.Errorf("auth params = %q, want %q", q, want)
+	h := s.AuthHeaders(1650000000000, 5000, "sig123")
+	want := map[string]string{
+		"X-BAPI-API-KEY":     "KEY",
+		"X-BAPI-TIMESTAMP":   "1650000000000",
+		"X-BAPI-RECV-WINDOW": "5000",
+		"X-BAPI-SIGN":        "sig123",
 	}
-}
-
-// TestAppendSignEmptyQuery — пустой query → только sign.
-func TestAppendSignEmptyQuery(t *testing.T) {
-	got := AppendSign("", "abc")
-	if got != "sign=abc" {
-		t.Errorf("got %q", got)
+	for k, v := range want {
+		if h[k] != v {
+			t.Errorf("header %s = %q, want %q", k, h[k], v)
+		}
 	}
-}
-
-// TestAppendSignNonEmpty
-func TestAppendSignNonEmpty(t *testing.T) {
-	got := AppendSign("api_key=K&timestamp=1", "abc")
-	if !strings.HasSuffix(got, "&sign=abc") {
-		t.Errorf("missing sign suffix: %q", got)
+	if len(h) != len(want) {
+		t.Errorf("unexpected extra headers: %v", h)
 	}
 }
 
 // TestBuildSortedQuery — детерминированный порядок параметров.
 func TestBuildSortedQuery(t *testing.T) {
 	params := map[string]string{
-		"zebra":   "3",
-		"apple":   "1",
-		"mango":   "2",
+		"zebra": "3",
+		"apple": "1",
+		"mango": "2",
 	}
 	q := BuildSortedQuery(params)
 	want := "apple=1&mango=2&zebra=3"
@@ -127,30 +121,27 @@ func TestZero(t *testing.T) {
 	}
 }
 
-// TestFullRequestFlow — end-to-end: сборка query + подпись.
+// TestFullRequestFlow — end-to-end по канону V5: query подписывается,
+// аутентификация уходит в заголовки, query несёт только бизнес-параметры.
 func TestFullRequestFlow(t *testing.T) {
 	s := NewSigner("MYAPIKEY", []byte("MYSECRET"))
 	ts := int64(1650000000000)
 
-	// Строим query с обязательными + бизнес-параметрами.
 	business := "category=linear&symbol=BTCUSDT"
-	auth := s.AuthParamsQuery(ts, 5000)
-	fullQuery := business + "&" + auth
+	payload, sig := s.SignGet(ts, 5000, business)
 
-	// Подписываем (payload использует business-query без auth, как требует V5).
-	_, sig := s.SignGet(ts, 5000, business)
-	signed := AppendSign(fullQuery, sig)
+	// Payload = timestamp + api_key + recv_window + query (V5 spec).
+	wantPayload := "1650000000000MYAPIKEY5000" + business
+	if payload != wantPayload {
+		t.Errorf("payload = %q, want %q", payload, wantPayload)
+	}
 
-	if !strings.Contains(signed, "api_key=MYAPIKEY") {
-		t.Error("missing api_key")
+	h := s.AuthHeaders(ts, 5000, sig)
+	if h["X-BAPI-SIGN"] != sig || h["X-BAPI-API-KEY"] != "MYAPIKEY" {
+		t.Errorf("auth headers incomplete: %v", h)
 	}
-	if !strings.Contains(signed, "timestamp=1650000000000") {
-		t.Error("missing timestamp")
-	}
-	if !strings.Contains(signed, "symbol=BTCUSDT") {
-		t.Error("missing business param")
-	}
-	if !strings.HasSuffix(signed, "&sign="+sig) {
-		t.Error("signature suffix missing")
+	// Query остаётся чистым — только бизнес-параметры.
+	if strings.Contains(business, "api_key") || strings.Contains(business, "sign") {
+		t.Error("business query must not contain auth params in V5")
 	}
 }

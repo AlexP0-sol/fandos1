@@ -199,3 +199,46 @@ func TestSymbolForRejectsConcatenation(t *testing.T) {
 		t.Errorf("OKX symbol=%s, want BTC-USDT-SWAP", sym)
 	}
 }
+
+// TestAllCanonicalAssetsSorted — AllCanonicalAssets возвращает активы в отсортированном порядке.
+func TestAllCanonicalAssetsSorted(t *testing.T) {
+	r := New()
+	r.Replace([]domain.CanonicalInstrument{
+		mkIns(domain.ExchangeBinance, "SOL", "SOLUSDT"),
+		mkIns(domain.ExchangeBinance, "ARB", "ARBUSDT"),
+		mkIns(domain.ExchangeBinance, "BTC", "BTCUSDT"),
+		mkIns(domain.ExchangeBinance, "ETH", "ETHUSDT"),
+	})
+	assets := r.AllCanonicalAssets()
+	for i := 1; i < len(assets); i++ {
+		if assets[i-1] >= assets[i] {
+			t.Errorf("assets not sorted at index %d: %s >= %s", i, assets[i-1], assets[i])
+		}
+	}
+	if len(assets) != 4 {
+		t.Errorf("expected 4 assets, got %d", len(assets))
+	}
+}
+
+// TestStatsDuplicates — дубликаты ключа (exchange, asset) учитываются в Stats.Duplicates.
+func TestStatsDuplicates(t *testing.T) {
+	r := New()
+	// Два инструмента с одинаковым ключом Binance/BTC — второй победит (last-wins),
+	// а Duplicates = 1.
+	r.Replace([]domain.CanonicalInstrument{
+		mkIns(domain.ExchangeBinance, "BTC", "BTCUSDT"),
+		mkIns(domain.ExchangeBinance, "BTC", "BTC_USDT"), // дубль
+		mkIns(domain.ExchangeBinance, "ETH", "ETHUSDT"),
+	})
+	s := r.Stats()
+	if s.Duplicates != 1 {
+		t.Errorf("Duplicates=%d, want 1", s.Duplicates)
+	}
+	// После Replace без дубликатов счётчик сбрасывается.
+	r.Replace([]domain.CanonicalInstrument{
+		mkIns(domain.ExchangeBinance, "BTC", "BTCUSDT"),
+	})
+	if s2 := r.Stats(); s2.Duplicates != 0 {
+		t.Errorf("Duplicates after clean replace=%d, want 0", s2.Duplicates)
+	}
+}

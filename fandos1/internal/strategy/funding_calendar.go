@@ -7,7 +7,6 @@
 package strategy
 
 import (
-	"errors"
 	"sort"
 	"time"
 
@@ -79,14 +78,14 @@ func BuildFundingCalendar(in CalendarInput, now time.Time) []FundingEvent {
 	stepIndex := 0
 	for !t.After(horizonEnd) {
 		ev := FundingEvent{
-			Exchange:         in.Exchange,
-			Symbol:           in.Symbol,
-			LegSide:          in.Side,
-			ScheduledAt:      t,
-			FundingRate:      in.PredictedRate,
-			RateType:         domain.FundingRatePredicted,
+			Exchange:          in.Exchange,
+			Symbol:            in.Symbol,
+			LegSide:           in.Side,
+			ScheduledAt:       t,
+			FundingRate:       in.PredictedRate,
+			RateType:          domain.FundingRatePredicted,
 			EstimatedNotional: in.Notional,
-			Confidence:       degradeConfidence(in.Confidence, stepIndex),
+			Confidence:        degradeConfidence(in.Confidence, stepIndex),
 		}
 		ev.EstimatedCashFlow = fundingCashFlow(in.Side, in.PredictedRate, in.Notional)
 		events = append(events, ev)
@@ -100,18 +99,10 @@ func BuildFundingCalendar(in CalendarInput, now time.Time) []FundingEvent {
 //
 //	FundingCashFlow = -sideSign × fundingRate × fundingNotional
 //
-// sideSign(long)=+1, sideSign(short)=-1.
+// sideSign(long)=+1, sideSign(short)=-1 (domain.Side.Sign).
 // При fundingRate > 0 (long платит short): long получает отрицательный поток, short — положительный.
 func fundingCashFlow(side domain.Side, rate, notional decimal.Decimal) decimal.Decimal {
-	// -sign × rate × notional, где sign = +1 для long, -1 для short.
-	// Используем MulInt напрямую с правильным int64 знаком.
-	var sign int64 = 1
-	if side == domain.SideLong {
-		sign = -1 // long: -1 × rate × notional
-	} else {
-		sign = 1 // short: +1 × rate × notional (т.к. sideSign=-1, -sideSign=+1)
-	}
-	return decimal.FromInt(sign).Mul(rate).Mul(notional)
+	return decimal.FromInt(int64(-side.Sign())).Mul(rate).Mul(notional)
 }
 
 // degradeConfidence снижает уровень уверенности с удалением от ближайшего события
@@ -155,20 +146,19 @@ const (
 )
 
 // ClassifyInterval — классифицирует пару по funding interval (раздел 8.2).
+// Классификация ОПИСАТЕЛЬНАЯ: решение «пропускать ли unaligned-пары»
+// (настройка RequireAlignedFundingTimes) принимает вызывающий по полученному классу.
 // longFundingInterval / shortFundingInterval — длительности интервалов.
-// longNext / shortNext — ближайшие события.
-// requireAligned + maxSkew — настройки RequireAlignedFundingTimes / MaxFundingTimeSkewMinutes.
+// longNext / shortNext — ближайшие события; нулевое время = данные отсутствуют → unaligned.
+// maxSkew — допустимый разъезд времени событий (MaxFundingTimeSkewMinutes).
 func ClassifyInterval(longFundingInterval, shortFundingInterval time.Duration,
-	longNext, shortNext time.Time, requireAligned bool, maxSkew time.Duration) IntervalClass {
+	longNext, shortNext time.Time, maxSkew time.Duration) IntervalClass {
 	if longFundingInterval != shortFundingInterval {
 		return ClassDifferentInterval
 	}
-	if !requireAligned {
-		// Одинаковый интервал, выравнивание не требуется.
-		// Но всё равно размечаем: если реально разъехались — unaligned, иначе aligned.
-		if longNext.IsZero() || shortNext.IsZero() {
-			return ClassSameIntervalUnaligned
-		}
+	if longNext.IsZero() || shortNext.IsZero() {
+		// Нет данных о времени события — консервативно считаем unaligned.
+		return ClassSameIntervalUnaligned
 	}
 	skew := longNext.Sub(shortNext)
 	if skew < 0 {
@@ -179,13 +169,6 @@ func ClassifyInterval(longFundingInterval, shortFundingInterval time.Duration,
 	}
 	return ClassSameIntervalUnaligned
 }
-
-// ============================================================
-// Ошибки
-// ============================================================
-
-// ErrZeroNotional — не указан объём ноги (невозможно посчитать cash flow).
-var ErrZeroNotional = errors.New("strategy: notional must be positive")
 
 // SortByScheduledAt — утилита для UI/логов.
 func SortByScheduledAt(events []FundingEvent) {

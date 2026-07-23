@@ -13,6 +13,7 @@ package marketdata
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -21,12 +22,15 @@ import (
 	"github.com/thecd/fundarbitrage/internal/domain"
 )
 
+// ErrAlreadyRunning — ошибка при повторном вызове Run().
+var ErrAlreadyRunning = errors.New("marketdata: ConnectionManager уже запущен")
+
 // BackoffConfig — параметры exponential backoff (раздел 7.4).
 type BackoffConfig struct {
-	Initial     time.Duration // первая задержка после обрыва (напр. 1s)
-	Max         time.Duration // потолок задержки (напр. 60s)
-	Multiplier  float64       // множитель роста (напр. 2.0)
-	Jitter      float64       // доля случайного разброса [0,1] (напр. 0.2 → ±20%)
+	Initial    time.Duration // первая задержка после обрыва (напр. 1s)
+	Max        time.Duration // потолок задержки (напр. 60s)
+	Multiplier float64       // множитель роста (напр. 2.0)
+	Jitter     float64       // доля случайного разброса [0,1] (напр. 0.2 → ±20%)
 }
 
 // DefaultBackoff — рекомендованные параметры (раздел 7.4: backoff с jitter).
@@ -40,17 +44,24 @@ var DefaultBackoff = BackoffConfig{
 // NextDelay считает задержку для данной попытки (attempt = 0 для первой).
 // Без jitter формула: min(Initial × Multiplier^attempt, Max).
 // С jitter: умножаем на (1 ± Jitter).
+// Потолок применяется внутри цикла умножения — float64 не достигает +Inf.
 func (b BackoffConfig) NextDelay(attempt int, r *rand.Rand) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	// Initial × Multiplier^attempt, с защитой от переполнения float.
+	maxF := float64(b.Max)
+	// Initial × Multiplier^attempt, с защитой от переполнения float:
+	// прекращаем умножение, как только достигли потолка.
 	d := float64(b.Initial)
-	for i := 0; i < attempt && d < float64(b.Max); i++ {
+	for i := 0; i < attempt; i++ {
 		d *= b.Multiplier
+		if d >= maxF {
+			d = maxF
+			break
+		}
 	}
-	if d > float64(b.Max) {
-		d = float64(b.Max)
+	if d > maxF {
+		d = maxF
 	}
 	// Jitter: равномерный множитель в [1-J, 1+J].
 	if b.Jitter > 0 && r != nil {
@@ -96,18 +107,22 @@ type ReconnectCallback func(ctx context.Context) error
 type ConnectionManager struct {
 	exchange domain.ExchangeID
 
-	backoff  BackoffConfig
-	breaker  CircuitBreakerConfig
+	backoff BackoffConfig
+	breaker CircuitBreakerConfig
 
+	// mu защищает все изменяемые поля ниже, включая state.
 	mu        sync.Mutex
-	state     atomic.Int32 // BreakerState
-	attempts  int          // последовательные неудачи
-	openedAt  time.Time    // когда разомкнут breaker (для ResetTimeout)
+	state     int32     // BreakerState, защищён m.mu
+	attempts  int       // последовательные неудачи
+	openedAt  time.Time // когда разомкнут breaker (для ResetTimeout)
 	connectCB ReconnectCallback
 
-	// Метрики (раздел 17.1: WebSocket reconnect count по бирже).
+	// Метрики (раздел 17.1): атомарны, не нуждаются в mu.
 	reconnectCount atomic.Int64
 	circuitTrips   atomic.Int64
+
+	// started — защита от двойного вызова Run.
+	started atomic.Bool
 
 	// rng для jitter. Инициализируется в Run; защищён локальной goroutine.
 	rng *rand.Rand
@@ -137,9 +152,12 @@ func (m *ConnectionManager) WithBreaker(b CircuitBreakerConfig) *ConnectionManag
 	return m
 }
 
-// State возвращает текущее состояние breaker.
+// State возвращает текущее состояние breaker. Кратко захватывает mu для чтения.
 func (m *ConnectionManager) State() BreakerState {
-	return BreakerState(m.state.Load())
+	m.mu.Lock()
+	s := BreakerState(m.state)
+	m.mu.Unlock()
+	return s
 }
 
 // ReconnectCount — сколько всего reconnect-попыток сделано.
@@ -154,7 +172,12 @@ func (m *ConnectionManager) CircuitTrips() int64 {
 
 // Run запускает reconnect-loop. Блокирует до отмены ctx.
 // При первом вызове сразу делает connect; при обрывах — повторяет по backoff.
+// Второй вызов Run возвращает ErrAlreadyRunning.
 func (m *ConnectionManager) Run(ctx context.Context) error {
+	if !m.started.CompareAndSwap(false, true) {
+		return ErrAlreadyRunning
+	}
+
 	// Свой rng на loop — jitter детерминирован в рамках одной goroutine.
 	m.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -176,9 +199,12 @@ func (m *ConnectionManager) Run(ctx context.Context) error {
 				return err
 			}
 			// probe-попытка: переходим в half-open (closed) и пробуем.
+			// Также сбрасываем счётчик попыток, чтобы probe не вызвала
+			// немедленное повторное размыкание (Open→Closed требует чистого старта).
 			m.mu.Lock()
-			if BreakerState(m.state.Load()) == BreakerOpen {
-				m.state.Store(int32(BreakerClosed))
+			if BreakerState(m.state) == BreakerOpen {
+				m.state = int32(BreakerClosed)
+				m.attempts = 0 // сброс при переходе Open→Closed
 			}
 			m.mu.Unlock()
 		}
@@ -202,8 +228,8 @@ func (m *ConnectionManager) Run(ctx context.Context) error {
 		m.mu.Lock()
 		m.attempts++
 		tripped := false
-		if m.attempts >= m.breaker.FailureThreshold && BreakerState(m.state.Load()) != BreakerOpen {
-			m.state.Store(int32(BreakerOpen))
+		if m.attempts >= m.breaker.FailureThreshold && BreakerState(m.state) != BreakerOpen {
+			m.state = int32(BreakerOpen)
 			m.openedAt = time.Now()
 			tripped = true
 		}
@@ -227,13 +253,14 @@ func (m *ConnectionManager) Run(ctx context.Context) error {
 func (m *ConnectionManager) allowAttempt(ctx context.Context) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if BreakerState(m.state.Load()) != BreakerOpen {
+	if BreakerState(m.state) != BreakerOpen {
 		return true
 	}
 	// Открыт. Проверяем ResetTimeout.
 	if time.Since(m.openedAt) >= m.breaker.ResetTimeout {
 		// Half-open → разрешаем одну probe.
-		m.state.Store(int32(BreakerClosed))
+		m.state = int32(BreakerClosed)
+		m.attempts = 0 // сброс при переходе Open→Closed
 		return true
 	}
 	return false

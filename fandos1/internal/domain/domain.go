@@ -22,20 +22,28 @@ const (
 	ExchangeGate    ExchangeID = "gate"
 )
 
+// supportedExchanges — единственный источник истины для списка поддерживаемых бирж.
+// SupportedExchanges() и IsValid() используют этот слайс.
+var supportedExchanges = []ExchangeID{
+	ExchangeBinance, ExchangeBybit, ExchangeMEXC, ExchangeOKX,
+	ExchangeBitget, ExchangeKuCoin, ExchangeGate,
+}
+
 // SupportedExchanges возвращает все поддерживаемые в v1 биржи.
+// Возвращает копию, чтобы вызывающий не мог изменить внутренний слайс.
 func SupportedExchanges() []ExchangeID {
-	return []ExchangeID{
-		ExchangeBinance, ExchangeBybit, ExchangeMEXC, ExchangeOKX,
-		ExchangeBitget, ExchangeKuCoin, ExchangeGate,
-	}
+	out := make([]ExchangeID, len(supportedExchanges))
+	copy(out, supportedExchanges)
+	return out
 }
 
 // IsValid проверяет, что биржа поддерживается.
+// Использует тот же источник истины, что и SupportedExchanges.
 func (e ExchangeID) IsValid() bool {
-	switch e {
-	case ExchangeBinance, ExchangeBybit, ExchangeMEXC, ExchangeOKX,
-		ExchangeBitget, ExchangeKuCoin, ExchangeGate:
-		return true
+	for _, id := range supportedExchanges {
+		if e == id {
+			return true
+		}
 	}
 	return false
 }
@@ -53,13 +61,18 @@ func (s Side) IsValid() bool {
 	return s == SideLong || s == SideShort
 }
 
-// SideSign возвращает +1 для long, -1 для short (конвенция funding, раздел 3.2).
-// panic при невалидной стороне невозможен, т.к. используется только после IsValid.
+// Sign возвращает +1 для long, -1 для short (конвенция funding, раздел 3.2).
+// Паникует при невалидной стороне — тихая неверная сторона в funding-математике
+// означает финансовую ошибку.
 func (s Side) Sign() int {
-	if s == SideLong {
+	switch s {
+	case SideLong:
 		return 1
+	case SideShort:
+		return -1
+	default:
+		panic(fmt.Sprintf("domain: Side.Sign() вызван с невалидным значением %q", string(s)))
 	}
-	return -1
 }
 
 // InstrumentType — тип инструмента. В v1 поддерживается только LINEAR_USDT_PERPETUAL (раздел 1.1).
@@ -73,9 +86,9 @@ const (
 type InstrumentStatus string
 
 const (
-	InstrumentStatusActive    InstrumentStatus = "active"
-	InstrumentStatusDelisted  InstrumentStatus = "delisted"
-	InstrumentStatusHalted    InstrumentStatus = "halted"
+	InstrumentStatusActive     InstrumentStatus = "active"
+	InstrumentStatusDelisted   InstrumentStatus = "delisted"
+	InstrumentStatusHalted     InstrumentStatus = "halted"
 	InstrumentStatusReduceOnly InstrumentStatus = "reduce_only"
 )
 
@@ -169,19 +182,19 @@ type OrderMode string
 
 const (
 	OrderMarketableLimitIOC OrderMode = "marketable_limit_ioc" // по умолчанию
-	OrderMarket             OrderMode = "market"                // только при явном разрешении
+	OrderMarket             OrderMode = "market"               // только при явном разрешении
 )
 
 // SystemState — глобальное состояние системы (раздел 4.3).
 type SystemState string
 
 const (
-	StateStarting        SystemState = "STARTING"
-	StateReady           SystemState = "READY"
-	StatePausedByUser    SystemState = "PAUSED_BY_USER"
-	StateSafeHalt        SystemState = "SAFE_HALT"
-	StateTradingLocked   SystemState = "TRADING_LOCKED"
-	StateRebalanceLocked SystemState = "REBALANCE_LOCKED"
+	StateStarting         SystemState = "STARTING"
+	StateReady            SystemState = "READY"
+	StatePausedByUser     SystemState = "PAUSED_BY_USER"
+	StateSafeHalt         SystemState = "SAFE_HALT"
+	StateTradingLocked    SystemState = "TRADING_LOCKED"
+	StateRebalanceLocked  SystemState = "REBALANCE_LOCKED"
 	StateRecoveryRequired SystemState = "RECOVERY_REQUIRED"
 )
 

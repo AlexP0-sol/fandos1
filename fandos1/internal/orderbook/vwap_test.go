@@ -215,3 +215,36 @@ func TestCheckDepthSufficient(t *testing.T) {
 		t.Error("depth 1 should be sufficient")
 	}
 }
+
+// TestCheckDepthSufficientEmpty — пустой стакан никогда не достаточен.
+func TestCheckDepthSufficientEmpty(t *testing.T) {
+	if CheckDepthSufficient(nil, decimal.MustFromString("1")) {
+		t.Error("empty levels should not be sufficient")
+	}
+	if CheckDepthSufficient([]domain.PriceLevel{}, decimal.MustFromString("0.001")) {
+		t.Error("empty slice should not be sufficient")
+	}
+}
+
+// TestSlippageBpsSell — slippage для продажи (VWAPSell side).
+// bids: 100×1, 99×9. Sell 10: 1×100 + 9×99 = 991 / 10 = 99.1
+// best bid = 100.00, |99.1-100|/100 × 10000 = 90 bps
+func TestSlippageBpsSell(t *testing.T) {
+	bids := []domain.PriceLevel{
+		lvl("100.00", "1"),
+		lvl("99.00", "9"),
+	}
+	r := VWAPSell(bids, decimal.MustFromString("10"))
+	if !r.FullyFilled {
+		t.Fatal("expected full fill")
+	}
+	wantVWAP := decimal.MustFromString("99.1")
+	if !r.VWAP.Equal(wantVWAP) {
+		t.Fatalf("VWAP=%s, want %s", r.VWAP, wantVWAP)
+	}
+	slippage := r.SlippageBps(decimal.MustFromString("100.00"))
+	want := decimal.MustFromString("90")
+	if !slippage.Equal(want) {
+		t.Errorf("slippage=%s bps, want %s", slippage, want)
+	}
+}

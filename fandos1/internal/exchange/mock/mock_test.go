@@ -3,6 +3,8 @@ package mock
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +60,34 @@ func TestFullFill(t *testing.T) {
 	}
 }
 
+// TestDefaultFullFill — при отсутствии FillRule ордер исполняется полностью по умолчанию.
+func TestDefaultFullFill(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	setupBook(m)
+	// FillRule не задан → frac = One по умолчанию.
+
+	ack, err := m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+		ClientOrderID: "c-default",
+		Symbol:        testSym,
+		Side:          domain.SideLong,
+		BaseQty:       decimal.MustFromString("3"),
+		Price:         decimal.MustFromString("100.50"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Status != domain.OrderStatusFilled {
+		t.Errorf("default fill status = %s, want filled", ack.Status)
+	}
+	o, ok := m.OrderByClient("c-default")
+	if !ok {
+		t.Fatal("order not found")
+	}
+	if !o.FilledQty.Equal(decimal.MustFromString("3")) {
+		t.Errorf("default filled = %s, want 3", o.FilledQty.String())
+	}
+}
+
 // TestPartialFill — частичное исполнение (50%).
 // Сценарий 60/50-типа (раздел 10.3).
 func TestPartialFill(t *testing.T) {
@@ -84,7 +114,7 @@ func TestPartialFill(t *testing.T) {
 	}
 }
 
-// TestReject — one-leg rejection (раздел 18.3).
+// TestReject — one-leg rejection через FillRule (раздел 18.3).
 func TestReject(t *testing.T) {
 	m := New(domain.ExchangeBinance)
 	setupBook(m)
@@ -102,6 +132,83 @@ func TestReject(t *testing.T) {
 	}
 	if ack.Status != domain.OrderStatusRejected {
 		t.Errorf("status = %s, want rejected", ack.Status)
+	}
+}
+
+// TestSetRejectNext — SetRejectNext декрементирует счётчик, возвращает reject в ack.
+func TestSetRejectNext(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	setupBook(m)
+	m.SetRejectNext(2)
+
+	// Первые два вызова — reject.
+	for i := 0; i < 2; i++ {
+		id := domain.ClientOrderID(fmt.Sprintf("rn-%d", i))
+		ack, err := m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+			ClientOrderID: id,
+			Symbol:        testSym,
+			Side:          domain.SideLong,
+			BaseQty:       decimal.MustFromString("1"),
+			Price:         decimal.MustFromString("100.50"),
+		})
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if ack.Status != domain.OrderStatusRejected {
+			t.Errorf("call %d: status = %s, want rejected", i, ack.Status)
+		}
+	}
+
+	// Третий вызов — успех (счётчик исчерпан).
+	ack, err := m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+		ClientOrderID: "rn-ok",
+		Symbol:        testSym,
+		Side:          domain.SideLong,
+		BaseQty:       decimal.MustFromString("1"),
+		Price:         decimal.MustFromString("100.50"),
+	})
+	if err != nil {
+		t.Fatalf("third call should succeed: %v", err)
+	}
+	if ack.Status != domain.OrderStatusFilled {
+		t.Errorf("third call status = %s, want filled", ack.Status)
+	}
+}
+
+// TestSetNetworkErrors — SetNetworkErrors декрементирует счётчик, возвращает ErrNetwork.
+func TestSetNetworkErrors(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	setupBook(m)
+	m.SetNetworkErrors(2)
+
+	// Первые два вызова — ErrNetwork.
+	for i := 0; i < 2; i++ {
+		id := domain.ClientOrderID(fmt.Sprintf("ne-%d", i))
+		_, err := m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+			ClientOrderID: id,
+			Symbol:        testSym,
+			Side:          domain.SideLong,
+			BaseQty:       decimal.MustFromString("1"),
+			Price:         decimal.MustFromString("100.50"),
+		})
+		if !errors.Is(err, exchange.ErrNetwork) {
+			t.Errorf("call %d: expected ErrNetwork, got %v", i, err)
+		}
+	}
+
+	// Третий вызов — успех.
+	ack, err := m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+		ClientOrderID: "ne-ok",
+		Symbol:        testSym,
+		Side:          domain.SideLong,
+		BaseQty:       decimal.MustFromString("1"),
+		Price:         decimal.MustFromString("100.50"),
+	})
+	if err != nil {
+		t.Fatalf("third call after network errors should succeed: %v", err)
+	}
+	if ack.Status != domain.OrderStatusFilled {
+		t.Errorf("third call status = %s, want filled", ack.Status)
 	}
 }
 
@@ -148,6 +255,27 @@ func TestGetOrderNotFound(t *testing.T) {
 	_, err := m.GetOrder(context.Background(), domain.OrderQuery{ClientOrderID: "nope"})
 	if !errors.Is(err, exchange.ErrOrderNotFound) {
 		t.Errorf("expected ErrOrderNotFound, got %v", err)
+	}
+}
+
+// TestGetOrderRateLimited — GetOrder при rate-limit возвращает ErrRateLimited
+// (критично для QUERY_THEN_DECIDE — caller должен уметь обработать этот случай).
+func TestGetOrderRateLimited(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	setupBook(m)
+	// Сначала создаём ордер.
+	_, _ = m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+		ClientOrderID: "rl-order",
+		Symbol:        testSym,
+		Side:          domain.SideLong,
+		BaseQty:       decimal.MustFromString("1"),
+		Price:         decimal.MustFromString("100.50"),
+	})
+	// Включаем rate limit.
+	m.SetRateLimited(true)
+	_, err := m.GetOrder(context.Background(), domain.OrderQuery{ClientOrderID: "rl-order"})
+	if !errors.Is(err, exchange.ErrRateLimited) {
+		t.Errorf("GetOrder under rate-limit: expected ErrRateLimited, got %v", err)
 	}
 }
 
@@ -255,6 +383,51 @@ func TestWSInject(t *testing.T) {
 	}
 }
 
+// TestDoubleSubscribePublic — повторный SubscribePublic закрывает старый канал.
+func TestDoubleSubscribePublic(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	ch1, err := m.SubscribePublic(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Второй SubscribePublic должен закрыть ch1.
+	_, err = m.SubscribePublic(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ch1 должен быть закрыт — чтение вернёт zero value, ok=false.
+	select {
+	case _, ok := <-ch1:
+		if ok {
+			t.Error("old public channel should be closed after re-subscribe")
+		}
+	default:
+		t.Error("old public channel should be closed (readable as closed)")
+	}
+}
+
+// TestDoubleSubscribePrivate — повторный SubscribePrivate закрывает старый канал.
+func TestDoubleSubscribePrivate(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	cred := domain.CredentialRef{Exchange: domain.ExchangeBinance, Kind: "trade"}
+	ch1, err := m.SubscribePrivate(context.Background(), cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.SubscribePrivate(context.Background(), cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case _, ok := <-ch1:
+		if ok {
+			t.Error("old private channel should be closed after re-subscribe")
+		}
+	default:
+		t.Error("old private channel should be closed (readable as closed)")
+	}
+}
+
 // TestADLState — возвращает заданное ADL-состояние (раздел 23).
 func TestADLState(t *testing.T) {
 	m := New(domain.ExchangeBinance)
@@ -309,6 +482,30 @@ func TestMarketablePriceFromBook(t *testing.T) {
 	if !o2.AvgFillPrice.Equal(decimal.MustFromString("100.00")) {
 		t.Errorf("short market price = %s, want 100.00", o2.AvgFillPrice.String())
 	}
+}
+
+// TestConcurrentPlaceOrder — параллельные PlaceOrder не вызывают гонок.
+func TestConcurrentPlaceOrder(t *testing.T) {
+	m := New(domain.ExchangeBinance)
+	setupBook(m)
+
+	var wg sync.WaitGroup
+	const n = 20
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := domain.ClientOrderID(fmt.Sprintf("concurrent-%d", i))
+			m.PlaceOrder(context.Background(), domain.PlaceOrderRequest{
+				ClientOrderID: id,
+				Symbol:        testSym,
+				Side:          domain.SideLong,
+				BaseQty:       decimal.MustFromString("1"),
+				Price:         decimal.MustFromString("100.50"),
+			})
+		}(i)
+	}
+	wg.Wait()
 }
 
 // TestImplementsInterface — гарантия на уровне компиляции уже есть (var _),

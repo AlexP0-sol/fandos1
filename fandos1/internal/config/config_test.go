@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"testing"
 
 	dec "github.com/thecd/fundarbitrage/internal/decimal"
@@ -159,5 +160,119 @@ func TestDefaultsConcurrency(t *testing.T) {
 	}
 	for i := 0; i < 50; i++ {
 		<-done
+	}
+}
+
+// ── Новые тесты для всех добавленных проверок ──────────────────────────────
+
+// TestHotValidateLeverageNotPositive — Leverage <= 0 отклоняется жёстко.
+func TestHotValidateLeverageNotPositive(t *testing.T) {
+	d := Defaults()
+	d.Leverage = dec.Zero
+	if _, err := d.Validate(); err == nil {
+		t.Error("expected error for zero Leverage")
+	}
+	d.Leverage = dec.MustFromString("-1")
+	if _, err := d.Validate(); err == nil {
+		t.Error("expected error for negative Leverage")
+	}
+}
+
+// TestHotValidateNegativeLosses — отрицательные лимиты убытков отклоняются.
+func TestHotValidateNegativeLosses(t *testing.T) {
+	d := Defaults()
+	d.MaxDailyLossUSDT = dec.MustFromString("-1")
+	if _, err := d.Validate(); err == nil {
+		t.Error("expected error for negative MaxDailyLossUSDT")
+	}
+
+	d2 := Defaults()
+	d2.MaxPositionLossUSDT = dec.MustFromString("-0.01")
+	if _, err := d2.Validate(); err == nil {
+		t.Error("expected error for negative MaxPositionLossUSDT")
+	}
+}
+
+// TestHotValidateUnknownMarginMode — неизвестный MarginMode отклоняется.
+func TestHotValidateUnknownMarginMode(t *testing.T) {
+	d := Defaults()
+	d.MarginMode = domain.MarginMode("portfolio")
+	if _, err := d.Validate(); err == nil {
+		t.Error("expected error for unknown MarginMode")
+	}
+}
+
+// TestHotValidateUnknownPositionMode — неизвестный PositionMode отклоняется.
+func TestHotValidateUnknownPositionMode(t *testing.T) {
+	d := Defaults()
+	d.PositionMode = domain.PositionMode("dual")
+	if _, err := d.Validate(); err == nil {
+		t.Error("expected error for unknown PositionMode")
+	}
+}
+
+// TestHotValidateHighLeverageWarning — Leverage > 20 даёт предупреждение HIGH_LEVERAGE.
+func TestHotValidateHighLeverageWarning(t *testing.T) {
+	d := Defaults()
+	d.MaxDailyLossUSDT = dec.MustFromString("100") // убираем NO_DAILY_STOP
+	d.Leverage = dec.MustFromString("25")
+	w, err := d.Validate()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasWarn(w, "HIGH_LEVERAGE") {
+		t.Error("expected HIGH_LEVERAGE warning for Leverage=25")
+	}
+}
+
+// TestLoadColdEnvIntParseError — DB_MAX_OPEN_CONNS задан, но не является числом.
+func TestLoadColdEnvIntParseError(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("DB_MAX_OPEN_CONNS", "notanumber")
+	if _, err := LoadCold(); err == nil {
+		t.Fatal("expected error for unparseable DB_MAX_OPEN_CONNS")
+	}
+	os.Unsetenv("DB_MAX_OPEN_CONNS")
+}
+
+// TestLoadColdEnvDurParseError — SHUTDOWN_TIMEOUT задан, но не является duration.
+func TestLoadColdEnvDurParseError(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("SHUTDOWN_TIMEOUT", "badvalue")
+	if _, err := LoadCold(); err == nil {
+		t.Fatal("expected error for unparseable SHUTDOWN_TIMEOUT")
+	}
+	os.Unsetenv("SHUTDOWN_TIMEOUT")
+}
+
+// TestLoadColdIdleConnsExceedOpen — DBMaxIdleConns > DBMaxOpenConns отклоняется.
+func TestLoadColdIdleConnsExceedOpen(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("DB_MAX_OPEN_CONNS", "5")
+	t.Setenv("DB_MAX_IDLE_CONNS", "10")
+	defer os.Unsetenv("DB_MAX_OPEN_CONNS")
+	defer os.Unsetenv("DB_MAX_IDLE_CONNS")
+	if _, err := LoadCold(); err == nil {
+		t.Fatal("expected error for idle > open conns")
+	}
+}
+
+// TestLoadColdNonPositiveShutdownTimeout — SHUTDOWN_TIMEOUT=0 отклоняется.
+func TestLoadColdNonPositiveShutdownTimeout(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("SHUTDOWN_TIMEOUT", "0s")
+	defer os.Unsetenv("SHUTDOWN_TIMEOUT")
+	if _, err := LoadCold(); err == nil {
+		t.Fatal("expected error for SHUTDOWN_TIMEOUT=0")
+	}
+}
+
+// TestLoadColdNonPositiveClockSyncInterval — CLOCK_SYNC_INTERVAL=0 отклоняется.
+func TestLoadColdNonPositiveClockSyncInterval(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("CLOCK_SYNC_INTERVAL", "0s")
+	defer os.Unsetenv("CLOCK_SYNC_INTERVAL")
+	if _, err := LoadCold(); err == nil {
+		t.Fatal("expected error for CLOCK_SYNC_INTERVAL=0")
 	}
 }

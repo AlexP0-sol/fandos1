@@ -13,6 +13,7 @@
 package allocation
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/thecd/fundarbitrage/internal/decimal"
@@ -21,13 +22,13 @@ import (
 
 // CandidateRequest — запрос кандидата на капитал (вход аллокатора).
 type CandidateRequest struct {
-	ID            string // уникальный id (для трассировки)
-	Asset         domain.AssetSymbol
-	LongExchange  domain.ExchangeID
-	ShortExchange domain.ExchangeID
+	ID             string // уникальный id (для трассировки)
+	Asset          domain.AssetSymbol
+	LongExchange   domain.ExchangeID
+	ShortExchange  domain.ExchangeID
 	CompositeScore decimal.Decimal // из strategy.CandidateScores.Composite
 	// DesiredQty — объём, который кандидат хотел бы (max из risk engine: liquidity/margin/limits).
-	DesiredQty    decimal.Decimal
+	DesiredQty decimal.Decimal
 	// NotionalPerUnit — оценка стоимости единицы (mark price), для учёта exposure в USDT.
 	NotionalPerUnit decimal.Decimal
 }
@@ -50,11 +51,11 @@ type Limits struct {
 
 // Allocation — результат для одного кандидата.
 type Allocation struct {
-	Request   CandidateRequest
-	AllocatedQty decimal.Decimal
+	Request           CandidateRequest
+	AllocatedQty      decimal.Decimal
 	AllocatedNotional decimal.Decimal
-	Rejected  bool
-	Reason    string // если Rejected
+	Rejected          bool
+	Reason            string // если Rejected
 }
 
 // Plan — итоговый план аллокации.
@@ -119,18 +120,36 @@ func Allocate(requests []CandidateRequest, limits Limits) Plan {
 		// 3. Применяем лимиты — берём min по всем ограничениям.
 		allowedNotional := desiredNotional
 
+		// Дедупликация бирж: когда long и short на одной бирже, добавляем notional
+		// в этот bucket только один раз (иначе двойной счёт).
+		sameExchange := req.LongExchange == req.ShortExchange
+
 		// Per-exchange exposure (long leg).
 		if cap, ok := exchAvail[req.LongExchange]; ok {
 			avail := cap.Sub(exchUsed[req.LongExchange])
+			if !avail.IsPositive() {
+				allocation.Rejected = true
+				allocation.Reason = fmt.Sprintf("over exchange limit: %s", req.LongExchange)
+				plan.Allocations = append(plan.Allocations, allocation)
+				continue
+			}
 			if avail.LessThan(allowedNotional) {
 				allowedNotional = avail
 			}
 		}
-		// Per-exchange exposure (short leg).
-		if cap, ok := exchAvail[req.ShortExchange]; ok {
-			avail := cap.Sub(exchUsed[req.ShortExchange])
-			if avail.LessThan(allowedNotional) {
-				allowedNotional = avail
+		// Per-exchange exposure (short leg) — только если другая биржа.
+		if !sameExchange {
+			if cap, ok := exchAvail[req.ShortExchange]; ok {
+				avail := cap.Sub(exchUsed[req.ShortExchange])
+				if !avail.IsPositive() {
+					allocation.Rejected = true
+					allocation.Reason = fmt.Sprintf("over exchange limit: %s", req.ShortExchange)
+					plan.Allocations = append(plan.Allocations, allocation)
+					continue
+				}
+				if avail.LessThan(allowedNotional) {
+					allowedNotional = avail
+				}
 			}
 		}
 		// Per-asset correlated notional.
@@ -166,8 +185,11 @@ func Allocate(requests []CandidateRequest, limits Limits) Plan {
 		allocation.AllocatedNotional = allocatedNotional
 
 		// 6. Списываем с budget.
+		// При sameExchange добавляем в bucket биржи только один раз.
 		exchUsed[req.LongExchange] = exchUsed[req.LongExchange].Add(allocatedNotional)
-		exchUsed[req.ShortExchange] = exchUsed[req.ShortExchange].Add(allocatedNotional)
+		if !sameExchange {
+			exchUsed[req.ShortExchange] = exchUsed[req.ShortExchange].Add(allocatedNotional)
+		}
 		assetUsed[req.Asset] = assetUsed[req.Asset].Add(allocatedNotional)
 		totalUsed = totalUsed.Add(allocatedNotional)
 

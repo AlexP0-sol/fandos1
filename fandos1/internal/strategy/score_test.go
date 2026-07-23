@@ -135,7 +135,7 @@ func TestCompositeWeighted(t *testing.T) {
 	zero := Score{decimal.Zero}
 	cs := CandidateScores{
 		CounterpartyRiskScore: Score{decimal.One},
-		LiquidityScore: zero, FundingConfidenceScore: zero, BasisStabilityScore: zero,
+		LiquidityScore:        zero, FundingConfidenceScore: zero, BasisStabilityScore: zero,
 		ExecutionRiskScore: zero, DataQualityScore: zero, ADLRiskScore: zero,
 	}
 	got := cs.Composite(DefaultWeights)
