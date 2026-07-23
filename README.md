@@ -56,10 +56,33 @@ Go ≥ 1.26. Зависимости: `shopspring/decimal` (арифметика)
 
 ## Статус
 
-Этапы 1–7 (архитектура, ядро домена, миграция core-схемы, mock-биржа, сканер, стратегия,
-портфель/риск, исполнение) — реализованы и покрыты тестами. Этапы 8–12 (реальные адаптеры
-бирж, слой БД, Telegram Mini App, ребалансировка, наблюдаемость, деплой) — в работе;
-актуальный статус по пакетам — в [`docs/ARCHITECTURE.md`](fandos1/docs/ARCHITECTURE.md).
+Реализованы и покрыты тестами (go test + go test -race зелёные):
+
+- **Этапы 1–7** — архитектура/ADR, домен, decimal, конфиг, секреты, mock-биржа,
+  instrument registry, market data, сканер, стратегия, аллокация, портфель/риск,
+  исполнение (QUERY_THEN_DECIDE, repair, coordinated close);
+- **Этап 8** — реальные адаптеры Binance USDT-M и Bybit V5 (REST+WS, contract-тесты);
+- **Слой данных** — миграции 0001–0003, `internal/repository` (pgx, атомарный Persister),
+  transactional outbox с retry/SKIP LOCKED (интеграционные тесты на PostgreSQL 16);
+- **Этап 9** — Telegram bot, сессии, Mini App API + dashboard (`webapp/`);
+- **Этап 10** — ребалансировка: планировщик 50/50, state machine c test-transfer barrier,
+  fee-cap, withdrawal circuit breaker (plan-only режим);
+- **Этап 11** — observability (slog+redaction, Prometheus-метрики, health), `cmd/server`
+  и `cmd/worker` с graceful shutdown, SAFE_HALT, DB-watchdog, NTP clock-sync,
+  Makefile / Dockerfile / docker-compose / CI / RUNBOOK.
+
+Быстрый старт (DRY_RUN, без реальных бирж — mock-контур с демо-данными):
+
+```bash
+make migrate DATABASE_URL=postgres://...   # применить миграции
+make run-worker-dry                        # сканер печатает кандидатов, /metrics на :9090
+make run-server                            # Mini App на :8080
+```
+
+Не реализовано (следующие шаги): live-подключение бирж (ввод учётных данных через
+Mini App + 2FA, раздел 13/27), keyrotation/kill switch, execution-цикл открытия позиций
+в worker, снапшот кандидатов для серверного API, load/chaos-тесты, поэтапный rollout
+(этап 12). Актуальный статус по пакетам — в [`docs/ARCHITECTURE.md`](fandos1/docs/ARCHITECTURE.md).
 
 ⚠️ **Не подключать реальные ключи и не включать LIVE-режим** до прохождения DRY_RUN
-и чек-листов раздела 21 мастер-промпта.
+и чек-листов раздела 21 мастер-промпта (см. [`docs/RUNBOOK.md`](docs/RUNBOOK.md)).

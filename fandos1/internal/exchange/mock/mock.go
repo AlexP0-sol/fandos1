@@ -30,6 +30,8 @@ type Mock struct {
 	balances    []domain.Balance
 	adlStates   map[domain.ExchangeSymbol]domain.ADLState
 	serverTime  time.Time
+	fundings    map[domain.ExchangeSymbol]domain.FundingInfo // явные funding-данные (SetFunding)
+	tickers     map[domain.ExchangeSymbol]domain.Ticker      // явные ticker-данные (SetTicker)
 
 	// Поведенческие флаги
 	ackTimeoutSymbols map[domain.ExchangeSymbol]bool // символы, чьи PlaceOrder не отвечают (ack timeout)
@@ -54,6 +56,8 @@ func New(id domain.ExchangeID) *Mock {
 		fillRules:         make(map[domain.ExchangeSymbol]FillRule),
 		adlStates:         make(map[domain.ExchangeSymbol]domain.ADLState),
 		ackTimeoutSymbols: make(map[domain.ExchangeSymbol]bool),
+		fundings:          make(map[domain.ExchangeSymbol]domain.FundingInfo),
+		tickers:           make(map[domain.ExchangeSymbol]domain.Ticker),
 		serverTime:        time.Unix(1700000000, 0).UTC(),
 	}
 }
@@ -181,10 +185,32 @@ func (m *Mock) GetInstruments(ctx context.Context) ([]domain.CanonicalInstrument
 	return out, nil
 }
 
+// SetFunding задаёт явные funding-данные символа (для тестов/демо).
+func (m *Mock) SetFunding(sym domain.ExchangeSymbol, fi domain.FundingInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fi.ExchangeSymbol = sym
+	m.fundings[sym] = fi
+}
+
+// SetTicker задаёт явные ticker-данные символа (для тестов/демо).
+func (m *Mock) SetTicker(sym domain.ExchangeSymbol, t domain.Ticker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t.Symbol = sym
+	m.tickers[sym] = t
+}
+
 func (m *Mock) GetFunding(ctx context.Context, sym domain.ExchangeSymbol) (domain.FundingInfo, error) {
 	if err := m.guard(); err != nil {
 		return domain.FundingInfo{}, err
 	}
+	m.mu.Lock()
+	if fi, ok := m.fundings[sym]; ok {
+		m.mu.Unlock()
+		return fi, nil
+	}
+	m.mu.Unlock()
 	return domain.FundingInfo{
 		ExchangeSymbol:       sym,
 		PredictedFundingRate: decimal.Zero,
@@ -201,6 +227,9 @@ func (m *Mock) GetTicker(ctx context.Context, sym domain.ExchangeSymbol) (domain
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if t, ok := m.tickers[sym]; ok {
+		return t, nil
+	}
 	t := domain.Ticker{Symbol: sym, Timestamp: m.serverTime}
 	if b, ok := m.books[sym]; ok {
 		if len(b.bids) > 0 {
