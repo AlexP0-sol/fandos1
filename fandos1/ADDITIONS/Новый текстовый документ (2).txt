@@ -1,0 +1,124 @@
+internal/credentials/crypto.go — envelope encryption (раздел 13.3, THREAT_MODEL A1/A3)
+// Package credentials реализует envelope encryption секретов бирж (раздел 13.3):
+// plaintext шифруется одноразовым DEK (AES-256-GCM), DEK шифруется master key.
+// Master key — только из env/KMS (ColdConfig.MasterKeyEnv), никогда в БД/репо.
+// Расшифровка — только в памяти на время подписи; вызывающий обязан Zero() plaintext.
+package credentials
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"os"
+)
+
+const (
+	// BlobVersion — версия формата; хранится в БД для будущих миграций формата/ротации.
+	BlobVersion = 1
+	keyLen      = 32 // AES-256
+)
+
+// Blob — зашифрованный секрет для хранения в exchange_credentials.
+// EncDEK и Ciphertext содержат nonce как префикс (nonce || sealed).
+type Blob struct {
+	Version    uint8
+	EncDEK     []byte // DEK, зашифрованный master key
+	Ciphertext []byte // секрет, зашифрованный DEK; AAD связывает blob с контекстом
+}
+
+// LoadMasterKey читает master key из env-переменной (base64, ровно 32 байта).
+func LoadMasterKey(envName string) ([]byte, error) {
+	raw, ok := os.LookupEnv(envName)
+	if !ok || raw == "" {
+		return nil, fmt.Errorf("credentials: env %s не задан", envName)
+	}
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: master key не base64: %w", err)
+	}
+	if len(key) != keyLen {
+		Zero(key)
+		return nil, fmt.Errorf("credentials: master key должен быть %d байт, получено %d", keyLen, len(key))
+	}
+	return key, nil
+}
+
+// Encrypt шифрует plaintext. aad — контекст привязки (например
+// "tenant:default|exchange:binance|kind:trade"), защищает от подмены blob между записями.
+func Encrypt(masterKey, plaintext, aad []byte) (*Blob, error) {
+	if len(masterKey) != keyLen {
+		return nil, fmt.Errorf("credentials: неверная длина master key")
+	}
+	dek := make([]byte, keyLen)
+	if _, err := rand.Read(dek); err != nil {
+		return nil, fmt.Errorf("credentials: rand DEK: %w", err)
+	}
+	defer Zero(dek)
+
+	ct, err := seal(dek, plaintext, aad)
+	if err != nil {
+		return nil, err
+	}
+	encDEK, err := seal(masterKey, dek, aad)
+	if err != nil {
+		return nil, err
+	}
+	return &Blob{Version: BlobVersion, EncDEK: encDEK, Ciphertext: ct}, nil
+}
+
+// Decrypt возвращает plaintext. Вызывающий ОБЯЗАН вызвать Zero() после использования.
+func Decrypt(masterKey []byte, b *Blob, aad []byte) ([]byte, error) {
+	if b == nil || b.Version != BlobVersion {
+		return nil, fmt.Errorf("credentials: неподдерживаемая версия blob")
+	}
+	dek, err := open(masterKey, b.EncDEK, aad)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: DEK unwrap: %w", err)
+	}
+	defer Zero(dek)
+	pt, err := open(dek, b.Ciphertext, aad)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: расшифровка секрета: %w", err)
+	}
+	return pt, nil
+}
+
+// Zero затирает буфер (best effort; см. ограничения GC в Go).
+func Zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func seal(key, plaintext, aad []byte) ([]byte, error) {
+	g, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, g.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return g.Seal(nonce, nonce, plaintext, aad), nil // nonce || ct
+}
+
+func open(key, data, aad []byte) ([]byte, error) {
+	g, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < g.NonceSize() {
+		return nil, fmt.Errorf("credentials: повреждённый blob")
+	}
+	return g.Open(nil, data[:g.NonceSize()], data[g.NonceSize():], aad)
+}

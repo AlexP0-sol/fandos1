@@ -1,0 +1,8 @@
+Отчёт по этапу (формат 22.4)
+Этап: 2 — Go skeleton, миграции, конфиг, secrets storage (продолжение)
+Артефакты: internal/config/config.go, internal/credentials/crypto.go, internal/credentials/crypto_test.go, migrations/0001_core.sql
+Тесты: crypto — round-trip, tamper, wrong-AAD/key, uniqueness; config — валидация опасных комбинаций (предупреждения из CONFIG_MODEL п.4). Запуск go test ./... && go test -race ./... после добавления файлов.
+Self-check: float64 отсутствует в новых пакетах ✅; секреты не попадают в логи (Blob не имеет String()) ✅; seed users = 1 строка (ADR-0001) ✅; hot-reload через pg_notify + Store.Swap с защитой от stale version ✅.
+Риски/открытые вопросы: (1) выбор мигратора — ADR-0004 (предлагаю golang-migrate); (2) Zero() в Go — best effort, GC может копировать буферы — зафиксировать в THREAT_MODEL как известное ограничение; (3) placeholder telegram_id=0 требует setup-процедуры первичной привязки владельца.
+Следующее действие: migrations/0002_trading.sql (positions, position_legs, execution_plans, orders, fills, funding_payments, adl_events) + пакеты internal/audit и internal/outbox (репозитории поверх созданных таблиц) + /healthz//readyz в cmd/server.
+Решение gate: готов продолжать — этап 2 ещё не закрыт, gate будет пройден после audit/outbox/health и 0002_trading.sql.
