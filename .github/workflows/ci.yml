@@ -1,0 +1,91 @@
+# CI pipeline для fundarbitrage (раздел 21: Definition of Done).
+# Запускается при каждом push и pull request в любую ветку.
+# Джобы: fmt-check, vet, build, test, test-race.
+# PostgreSQL service container позволяет интеграционным тестам репозитория
+# подключиться к реальной БД; при недоступности тесты пропускаются gracefully.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  # Передаём DATABASE_URL для интеграционных тестов (internal/repository и т.д.).
+  # Тесты должны пропускать себя через t.Skip() при недоступности БД.
+  DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
+
+jobs:
+  ci:
+    name: Build, Vet, Test
+    runs-on: ubuntu-latest
+
+    # PostgreSQL service container — доступен на localhost через стандартный порт.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        # Все шаги выполняются в подкаталоге Go-модуля.
+        working-directory: fandos1
+
+    steps:
+      # --------------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # 2. Setup Go (версия из go.mod; кэш модулей включён по умолчанию)
+      # --------------------------------------------------------
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: fandos1/go.mod
+          cache: true
+          cache-dependency-path: fandos1/go.sum
+
+      # --------------------------------------------------------
+      # 3. gofmt check — форматирование обязательно (раздел 21 п.3)
+      # --------------------------------------------------------
+      - name: Check gofmt
+        run: test -z "$(gofmt -l .)"
+
+      # --------------------------------------------------------
+      # 4. go vet — статический анализ
+      # --------------------------------------------------------
+      - name: go vet
+        run: go vet ./...
+
+      # --------------------------------------------------------
+      # 5. go build — убеждаемся, что весь код компилируется
+      # --------------------------------------------------------
+      - name: go build
+        run: go build ./...
+
+      # --------------------------------------------------------
+      # 6. go test — unit и интеграционные тесты
+      # --------------------------------------------------------
+      - name: go test
+        run: go test ./... -count=1
+
+      # --------------------------------------------------------
+      # 7. go test -race — проверка на гонки данных
+      # --------------------------------------------------------
+      - name: go test -race
+        run: go test -race ./... -count=1
