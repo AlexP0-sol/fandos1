@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "go: build all",
+      "type": "shell",
+      "command": "go build ./...",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "go: test all",
+      "type": "shell",
+      "command": "go test ./... -count=1",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "go: test -race",
+      "type": "shell",
+      "command": "CGO_ENABLED=1 go test -race ./... -count=1",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "go: vet",
+      "type": "shell",
+      "command": "go vet ./...",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "go: gofmt (write)",
+      "type": "shell",
+      "command": "gofmt -w ."
+    },
+    {
+      "label": "db: применить миграции",
+      "type": "shell",
+      "command": "for f in migrations/000*_*.sql; do echo \"=> $f\"; psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\" || exit 1; done",
+      "options": { "env": { "DATABASE_URL": "${env:DATABASE_URL}" } },
+      "problemMatcher": []
+    }
+  ]
+}

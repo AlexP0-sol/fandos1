@@ -12,13 +12,17 @@ coverage.txt
 # Env / secrets — НИКОГДА не коммитить
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
 # IDE
 .idea/
-.vscode/
 *.swp
+# .vscode/ — коммитим шаблоны конфигов (settings/launch/tasks/extensions),
+# но не пользовательские локальные файлы:
+.vscode/*.log
+.history/
 
 # OS
 .DS_Store

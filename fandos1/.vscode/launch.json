@@ -1,0 +1,56 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "worker: DRY_RUN (mock, без ордеров)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/worker",
+      "envFile": "${workspaceFolder}/.env",
+      "env": { "RUN_MODE": "dry_run", "NTP_SERVERS": "" }
+    },
+    {
+      "name": "worker: DRY_RUN + демо-ордера (полный цикл на mock)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/worker",
+      "envFile": "${workspaceFolder}/.env",
+      "env": { "RUN_MODE": "dry_run", "NTP_SERVERS": "", "FANDOS_DEMO_ORDERS": "1" }
+    },
+    {
+      "name": "worker: LIVE (реальные ордера!)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/worker",
+      "envFile": "${workspaceFolder}/.env",
+      "env": { "RUN_MODE": "live" }
+    },
+    {
+      "name": "server: API + Telegram Mini App",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/server",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Отладка текущего теста (файл в редакторе)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "worker + server (DRY_RUN)",
+      "configurations": [
+        "worker: DRY_RUN + демо-ордера (полный цикл на mock)",
+        "server: API + Telegram Mini App"
+      ]
+    }
+  ]
+}

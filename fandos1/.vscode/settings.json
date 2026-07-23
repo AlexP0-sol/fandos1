@@ -1,0 +1,26 @@
+{
+  "go.useLanguageServer": true,
+  "go.toolsManagement.autoUpdate": true,
+  "gopls": {
+    "ui.semanticTokens": true,
+    "formatting.gofumpt": false
+  },
+  "go.lintTool": "govet",
+  "go.formatTool": "gofmt",
+  "go.testFlags": ["-count=1", "-v"],
+  "go.testTimeout": "120s",
+  "go.buildOnSave": "package",
+  "go.vetOnSave": "package",
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4,
+    "editor.codeActionsOnSave": { "source.organizeImports": "explicit" }
+  },
+  "[sql]": { "editor.tabSize": 4 },
+  "files.eol": "\n",
+  "search.exclude": {
+    "**/bin": true,
+    "**/*.md": false
+  }
+}

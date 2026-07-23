@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "golang.go",
+    "ms-azuretools.vscode-docker",
+    "ckolkman.vscode-postgres",
+    "redhat.vscode-yaml",
+    "tamasfe.even-better-toml"
+  ]
+}
