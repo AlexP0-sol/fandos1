@@ -8,7 +8,11 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/worker",
       "envFile": "${workspaceFolder}/.env",
-      "env": { "RUN_MODE": "dry_run", "NTP_SERVERS": "" }
+      "env": {
+        "RUN_MODE": "dry_run",
+        "NTP_SERVERS": ""
+      },
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "worker: DRY_RUN + демо-ордера (полный цикл на mock)",
@@ -17,7 +21,12 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/worker",
       "envFile": "${workspaceFolder}/.env",
-      "env": { "RUN_MODE": "dry_run", "NTP_SERVERS": "", "FANDOS_DEMO_ORDERS": "1" }
+      "env": {
+        "RUN_MODE": "dry_run",
+        "NTP_SERVERS": "",
+        "FANDOS_DEMO_ORDERS": "1"
+      },
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "worker: LIVE (реальные ордера!)",
@@ -26,7 +35,10 @@
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/worker",
       "envFile": "${workspaceFolder}/.env",
-      "env": { "RUN_MODE": "live" }
+      "env": {
+        "RUN_MODE": "live"
+      },
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "server: API + Telegram Mini App",
@@ -34,7 +46,11 @@
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/cmd/server",
-      "envFile": "${workspaceFolder}/.env"
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "WEBAPP_DIR": "${workspaceFolder}/webapp"
+      }
     },
     {
       "name": "Отладка текущего теста (файл в редакторе)",

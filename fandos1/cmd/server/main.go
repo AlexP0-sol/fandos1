@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,10 +45,7 @@ func run() error {
 
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	allowlist := allowlistFromEnv(os.Getenv("TELEGRAM_ADMIN_IDS"))
-	webAppDir := os.Getenv("WEBAPP_DIR")
-	if webAppDir == "" {
-		webAppDir = "webapp"
-	}
+	webAppDir := resolveWebAppDir(os.Getenv("WEBAPP_DIR"), log)
 
 	sessions := telegram.NewSessionManager(telegram.NewMemorySessionStore())
 
@@ -121,6 +120,62 @@ func run() error {
 	err = sup.Run(ctx, components)
 	log.Info("server stopped", "err", errStr(err))
 	return err
+}
+
+// resolveWebAppDir устойчиво находит папку webapp/ независимо от того, откуда
+// запущен процесс (терминал, VS Code F5, собранный бинарник). Порядок поиска:
+//  1. WEBAPP_DIR из окружения, если задан и содержит index.html;
+//  2. "webapp" рядом с текущей рабочей папкой;
+//  3. "webapp" рядом с исполняемым файлом;
+//  4. поиск вверх от рабочей папки и от бинарника (до 6 уровней) —
+//     ищем каталог модуля (go.mod) с подпапкой webapp.
+//
+// Если ничего не найдено — возвращает "webapp" (сервер отдаст понятную 404).
+func resolveWebAppDir(fromEnv string, log *slog.Logger) string {
+	has := func(dir string) bool {
+		if dir == "" {
+			return false
+		}
+		_, err := os.Stat(filepath.Join(dir, "index.html"))
+		return err == nil
+	}
+	if has(fromEnv) {
+		return fromEnv
+	}
+	candidates := []string{"webapp"}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(exeDir, "webapp"))
+	}
+	// Поиск вверх от рабочей папки и от каталога бинарника.
+	var roots []string
+	if wd, err := os.Getwd(); err == nil {
+		roots = append(roots, wd)
+	}
+	if exe, err := os.Executable(); err == nil {
+		roots = append(roots, filepath.Dir(exe))
+	}
+	for _, root := range roots {
+		dir := root
+		for i := 0; i < 6; i++ {
+			candidates = append(candidates, filepath.Join(dir, "webapp"))
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	for _, c := range candidates {
+		if has(c) {
+			if c != fromEnv && c != "webapp" {
+				log.Info("webapp найден автоматически", "dir", c)
+			}
+			return c
+		}
+	}
+	log.Warn("webapp/index.html не найден — панель будет отдавать 404; задайте WEBAPP_DIR")
+	return "webapp"
 }
 
 // allowlistFromEnv — TELEGRAM_ADMIN_IDS="123,456" → StaticAllowlist.
