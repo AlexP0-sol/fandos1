@@ -114,7 +114,15 @@ func (c *ColdConfig) validate() error {
 
 func envStr(k, d string) string {
 	if v, ok := os.LookupEnv(k); ok {
-		return v
+		// Защита от типичных ошибок .env-файлов: хвостовые пробелы и
+		// inline-комментарии («значение   # пояснение») — обрезаем.
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = v[:i]
+		}
+		if i := strings.Index(v, "\t#"); i >= 0 {
+			v = v[:i]
+		}
+		return strings.TrimSpace(v)
 	}
 	return d
 }
