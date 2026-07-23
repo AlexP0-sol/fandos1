@@ -150,9 +150,9 @@ func New(cfg Config) (*Adapter, error) {
 	if a.restBase == "" {
 		a.restBase = defaultRESTBase
 	}
-	if a.wsBase == "" {
-		a.wsBase = defaultWSBase
-	}
+	// wsBase не устанавливается по умолчанию: пользователь обязан явно задать Config.WSBaseURL.
+	// Если WSBaseURL пуст — SubscribePublic возвращает ErrWSNotImplemented.
+	// Рекомендуемый URL: defaultWSBase = wss://fx-ws.gateio.ws/v4/ws/usdt.
 	if a.clock == nil {
 		a.clock = time.Now
 	}
@@ -1689,24 +1689,12 @@ func (a *Adapter) GetNetworkInfo(ctx context.Context, asset string) ([]domain.Ne
 }
 
 // ============================================================
-// WebSocket — TODO:VERIFY (WS URI), возвращает ErrWSNotImplemented
+// WebSocket — реализация перенесена в ws.go
 // ============================================================
 
-// ErrWSNotImplemented — WebSocket не реализован в Gate.io адаптере v1.
-// TODO: реализовать SubscribePublic/SubscribePrivate через wss://fx-ws.gateio.ws/v4/ws/usdt.
-var ErrWSNotImplemented = errors.New("gate: WebSocket не реализован (TODO)")
-
-// SubscribePublic — WebSocket публичные каналы.
-// TODO:VERIFY URI wss://fx-ws.gateio.ws/v4/ws/usdt, каналы futures.tickers / futures.order_book.
-func (a *Adapter) SubscribePublic(_ context.Context, _ []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
-	return nil, fmt.Errorf("%w: используйте REST polling для Gate.io", ErrWSNotImplemented)
-}
-
-// SubscribePrivate — WebSocket приватные каналы.
-// TODO:VERIFY приватная аутентификация WS Gate.io.
-func (a *Adapter) SubscribePrivate(_ context.Context, _ domain.CredentialRef) (<-chan exchange.PrivateEvent, error) {
-	return nil, fmt.Errorf("%w: используйте REST polling для Gate.io", ErrWSNotImplemented)
-}
+// ErrWSNotImplemented — stub для приватного WS Gate.io (не реализован).
+// SubscribePublic реализован в ws.go; SubscribePrivate возвращает эту ошибку.
+var ErrWSNotImplemented = errors.New("gate: WebSocket приватный канал не реализован (TODO)")
 
 // ============================================================
 // Вспомогательные функции

@@ -833,3 +833,247 @@ func TestClaimOwner_NilOwner(t *testing.T) {
 		t.Fatalf("auth без Owner = %d; body: %s", resp.StatusCode, body)
 	}
 }
+
+// ============================================================
+// Kill-switch tests
+// ============================================================
+
+// fakeKillSwitchProvider — stub KillSwitchProvider.
+type fakeKillSwitchProvider struct {
+	engageCalled bool
+	engageReason string
+	engageErr    error
+	halted       bool
+	haltedReason string
+	statusErr    error
+}
+
+func (f *fakeKillSwitchProvider) Engage(_ context.Context, reason string) error {
+	f.engageCalled = true
+	f.engageReason = reason
+	if f.engageErr == nil {
+		f.halted = true
+	}
+	return f.engageErr
+}
+
+func (f *fakeKillSwitchProvider) Status(_ context.Context) (bool, string, error) {
+	return f.halted, f.haltedReason, f.statusErr
+}
+
+// TestKillSwitch_Engage_200 — POST /api/killswitch → engage called, 200.
+func TestKillSwitch_Engage_200(t *testing.T) {
+	ks := &fakeKillSwitchProvider{}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "test emergency"}
+
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-ks-001", nil, req)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /api/killswitch = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	if !ks.engageCalled {
+		t.Error("Engage was not called")
+	}
+
+	var result map[string]string
+	decodeResp(t, resp, &result)
+	if result["status"] != "halted" {
+		t.Errorf("status = %q, want halted", result["status"])
+	}
+}
+
+// TestKillSwitch_Status_Get — GET /api/killswitch returns current state.
+func TestKillSwitch_Status_Get(t *testing.T) {
+	ks := &fakeKillSwitchProvider{halted: true, haltedReason: "test"}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	resp := doRequest(t, srv, "GET", "/api/killswitch", token, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /api/killswitch = %d; body: %s", resp.StatusCode, b)
+	}
+
+	var result struct {
+		Halted bool   `json:"halted"`
+		Reason string `json:"reason"`
+	}
+	decodeResp(t, resp, &result)
+	if !result.Halted {
+		t.Error("halted should be true")
+	}
+}
+
+// TestKillSwitch_NilProvider_501 — 501 when KillSwitch not wired.
+func TestKillSwitch_NilProvider_501(t *testing.T) {
+	_, srv := newTestHandler(HandlerDeps{})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+
+	// POST
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "x"}
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-nil-ks", nil, req)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("POST /api/killswitch nil provider = %d, want 501", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// GET
+	resp2 := doRequest(t, srv, "GET", "/api/killswitch", token, "", nil)
+	if resp2.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("GET /api/killswitch nil provider = %d, want 501", resp2.StatusCode)
+	}
+	resp2.Body.Close()
+}
+
+// ============================================================
+// 2FA middleware tests
+// ============================================================
+
+// TestTwoFactor_MissingCode_401 — verifier set, no X-2FA-Code header → 401.
+func TestTwoFactor_MissingCode_401(t *testing.T) {
+	ks := &fakeKillSwitchProvider{}
+	verifier := &MemorySharedSecretVerifier{Secret: "test-secret"}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks, TwoFactor: verifier})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "x"}
+	// No X-2FA-Code header — should be 401.
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-2fa-miss", nil, req)
+	if resp.StatusCode != http.StatusUnauthorized {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("missing 2FA code = %d, want 401; body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+}
+
+// TestTwoFactor_WrongCode_403 — verifier set, wrong code → 403.
+func TestTwoFactor_WrongCode_403(t *testing.T) {
+	ks := &fakeKillSwitchProvider{}
+	verifier := &MemorySharedSecretVerifier{Secret: "correct-secret"}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks, TwoFactor: verifier})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "x"}
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-2fa-bad", map[string]string{"X-2FA-Code": "wrong"}, req)
+	if resp.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("wrong 2FA code = %d, want 403; body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+}
+
+// TestTwoFactor_NilVerifier_Allowed — nil verifier → 2FA disabled, request allowed.
+func TestTwoFactor_NilVerifier_Allowed(t *testing.T) {
+	ks := &fakeKillSwitchProvider{}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks}) // TwoFactor: nil
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "x"}
+	// No X-2FA-Code, nil verifier → should be allowed.
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-2fa-nil", nil, req)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("nil verifier: %d, want 200; body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+}
+
+// TestTwoFactor_CorrectCode_Allowed — correct code → request passes through.
+func TestTwoFactor_CorrectCode_Allowed(t *testing.T) {
+	ks := &fakeKillSwitchProvider{}
+	verifier := &MemorySharedSecretVerifier{Secret: "my-2fa-code"}
+	_, srv := newTestHandler(HandlerDeps{KillSwitch: ks, TwoFactor: verifier})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	req := struct {
+		Reason string `json:"reason"`
+	}{Reason: "x"}
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/killswitch", token, "idem-2fa-ok", map[string]string{"X-2FA-Code": "my-2fa-code"}, req)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("correct 2FA code: %d, want 200; body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+}
+
+// TestTwoFactor_CredentialsSave_Gated — POST /api/credentials also requires 2FA when set.
+func TestTwoFactor_CredentialsSave_Gated(t *testing.T) {
+	fp := &fakeCredentialsProvider{fingerprintToReturn: "fp-2fa"}
+	verifier := &MemorySharedSecretVerifier{Secret: "cred-secret"}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp, TwoFactor: verifier})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	body := saveCredentialRequest{
+		Exchange:  "binance",
+		Kind:      "trade",
+		APIKey:    "key123",
+		APISecret: "sec456",
+	}
+	// Without 2FA code → 401.
+	resp := doRequestWithHeaders(t, srv, "POST", "/api/credentials", token, "idem-cred-2fa", nil, body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("credentials without 2FA: %d, want 401; body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+}
+
+// doRequestWithHeaders is like doRequest but accepts extra headers and optional body.
+func doRequestWithHeaders(t *testing.T, srv *httptest.Server, method, path, token, idemKey string, extraHeaders map[string]string, body interface{}) *http.Response {
+	t.Helper()
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		reqBody = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, reqBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if idemKey != "" {
+		req.Header.Set("X-Idempotency-Key", idemKey)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	return resp
+}

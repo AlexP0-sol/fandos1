@@ -49,6 +49,14 @@ func run() error {
 	}
 
 	sessions := telegram.NewSessionManager(telegram.NewMemorySessionStore())
+
+	// Второй фактор для критичных мутаций (kill switch, ввод ключей): включается,
+	// если задан FANDOS_2FA_SECRET (общий секрет). Пусто → 2FA отключён (dev).
+	var twoFactor telegram.TwoFactorVerifier
+	if secret := os.Getenv("FANDOS_2FA_SECRET"); secret != "" {
+		twoFactor = &telegram.MemorySharedSecretVerifier{Secret: secret}
+		log.Info("2FA включён для критичных мутаций")
+	}
 	handler := telegram.NewHandler(
 		telegram.APIConfig{
 			BotToken:  botToken,
@@ -56,12 +64,16 @@ func run() error {
 		},
 		telegram.Config{Token: botToken, WebAppDir: webAppDir},
 		telegram.HandlerDeps{
-			Sessions:   sessions,
-			Idem:       telegram.NewMemoryIdemStore(),
-			Status:     &app.DBStatusProvider{Boot: boot},
-			Candidates: app.EmptyCandidatesProvider{},
-			Settings:   &app.DBSettingsProvider{Repo: boot.Settings},
-			Closer:     &app.LockingCloseRequester{Boot: boot},
+			Sessions:    sessions,
+			Idem:        telegram.NewMemoryIdemStore(),
+			Status:      &app.DBStatusProvider{Boot: boot},
+			Candidates:  app.EmptyCandidatesProvider{},
+			Settings:    &app.DBSettingsProvider{Repo: boot.Settings},
+			Closer:      &app.LockingCloseRequester{Boot: boot},
+			Credentials: &app.DBCredentialsProvider{Boot: boot, UserID: 1},
+			Owner:       &app.DBOwnerClaimer{Boot: boot},
+			KillSwitch:  app.NewDBKillSwitchProvider(boot),
+			TwoFactor:   twoFactor,
 		},
 	)
 

@@ -61,9 +61,9 @@ Go ≥ 1.26. Зависимости: `shopspring/decimal` (арифметика)
 - **Этапы 1–7** — архитектура/ADR, домен, decimal, конфиг, секреты, mock-биржа,
   instrument registry, market data, сканер, стратегия, аллокация, портфель/риск,
   исполнение (QUERY_THEN_DECIDE, repair, coordinated close);
-- **Этап 8** — реальные адаптеры ВСЕХ 7 бирж (REST + contract-тесты): Binance USDT-M,
-  Bybit V5, OKX V5, Bitget V2, KuCoin Futures, MEXC Contract, Gate.io V4. WebSocket —
-  у Binance/Bybit готов, у остальных REST-поллинг (WS помечен TODO в коде);
+- **Этап 8** — реальные адаптеры ВСЕХ 7 бирж (REST + WebSocket + contract-тесты):
+  Binance USDT-M, Bybit V5, OKX V5, Bitget V2, KuCoin Futures, MEXC Contract, Gate.io V4.
+  Публичные WS-потоки (ticker/BBO/funding/depth) реализованы для всех семи;
 - **Слой данных** — миграции 0001–0003, `internal/repository` (pgx, атомарный Persister),
   transactional outbox с retry/SKIP LOCKED (интеграционные тесты на PostgreSQL 16);
 - **Этап 9** — Telegram bot, сессии, Mini App API + dashboard (`webapp/`);
@@ -88,13 +88,18 @@ make run-server                            # Mini App на :8080
   live-wiring реальных адаптеров из зашифрованных ключей. Проверено сквозным smoke на 7
   mock-биржах: движок сам выбрал long binance / short gate (максимальный funding-спред),
   открыл дельта-нейтральную позицию и закрыл её по запросу через transactional outbox.
+- **Безопасность ключей** (`internal/keyrotation`, раздел 27) — ротация ключей, **kill switch**
+  (мгновенный SAFE_HALT + отзыв ключей), 2FA-гейт критичных мутаций; кнопка в Mini App.
+- **Персист объёмов по ногам** (`position_legs`) — точный сплит long/short переживает рестарт
+  (проверено: open → рестарт → восстановление 0.05/0.05 → корректное закрытие обеих ног).
 
-Не реализовано (следующие шаги): keyrotation/kill switch и 2FA-гейт критичных мутаций
-(раздел 27); WebSocket для OKX/Bitget/KuCoin/MEXC/Gate (сейчас REST-поллинг); persist
-per-leg объёмов в position_legs (сейчас в БД хранится только net delta — точный сплит ног
-теряется при рестарте); снапшот кандидатов для серверного API; сверка withdrawal/deposit
-эндпоинтов (помечены TODO:VERIFY); load/chaos-тесты; финальный production rollout.
-Актуальный статус по пакетам — в [`docs/ARCHITECTURE.md`](fandos1/docs/ARCHITECTURE.md).
+**Система готова к эксплуатации — остаётся только ввести API-ключи бирж.** Пошаговое
+руководство (выгрузка на компьютер, установка, DRY_RUN, ввод ключей, LIVE): **[`docs/USAGE.md`](fandos1/docs/USAGE.md)**.
+
+Оставлено как осознанные расширения (не блокируют запуск): приватные WS-каналы у 5 бирж
+(REST-поллинг работает), полный TOTP/Telegram-2FA вместо shared-secret заглушки, снапшот
+кандидатов для серверного API, сверка редких withdrawal/transfer эндпоинтов (`TODO:VERIFY`),
+load/chaos-тесты. Статус по пакетам — в [`docs/ARCHITECTURE.md`](fandos1/docs/ARCHITECTURE.md).
 
 ⚠️ **Не подключать реальные ключи и не включать LIVE-режим** до прохождения DRY_RUN
 и чек-листов раздела 21 мастер-промпта (см. [`docs/RUNBOOK.md`](docs/RUNBOOK.md)).

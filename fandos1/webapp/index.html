@@ -459,6 +459,86 @@
       color: var(--text-dim);
       margin-top: 2px;
     }
+
+    /* ===== KILL SWITCH ===== */
+    .killswitch-panel {
+      background: #1a0a0a;
+      border: 2px solid var(--red-dim);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+    }
+    .killswitch-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .killswitch-title {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: bold;
+      color: var(--red);
+      letter-spacing: 1px;
+    }
+    .btn-killswitch {
+      padding: 8px 20px;
+      background: #3d0a0a;
+      border: 2px solid var(--red);
+      border-radius: var(--radius);
+      color: var(--red);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: bold;
+      letter-spacing: 1px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+    .btn-killswitch:hover { background: #5a1010; }
+    .btn-killswitch:disabled { opacity: 0.5; cursor: default; }
+    .badge-halted {
+      background: #3d1010; color: var(--red);
+      border: 1px solid var(--red-dim);
+      padding: 3px 10px;
+      border-radius: 3px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+    }
+    .badge-running-ks {
+      background: #0a2a1a; color: var(--green);
+      border: 1px solid var(--green-dim);
+      padding: 3px 10px;
+      border-radius: 3px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+    }
+    .killswitch-desc {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 8px;
+    }
+    .twofa-row {
+      margin-top: 10px;
+      display: none;
+    }
+    .twofa-row.visible { display: flex; align-items: center; gap: 8px; }
+    .twofa-row .form-label { min-width: 80px; }
+    .twofa-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-head);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 5px 8px;
+    }
+    .twofa-input:focus { outline: 1px solid var(--accent); }
   </style>
 </head>
 <body>
@@ -653,9 +733,33 @@
             </div>
             <input class="form-input" id="key-passphrase" type="password" autocomplete="new-password" placeholder="Passphrase (if required)" style="width:auto;flex:1;text-align:left">
           </div>
+          <div class="form-row" id="cred-2fa-row" style="display:none">
+            <div class="form-label">
+              2FA Code
+              <div class="key-passphrase-note">Required when 2FA is enabled on the server</div>
+            </div>
+            <input class="form-input" id="key-2fa-code" type="password" autocomplete="one-time-code" placeholder="2FA code (if required)" style="width:auto;flex:1;text-align:left">
+          </div>
           <div id="key-add-error" class="error-text" style="display:none"></div>
           <button class="btn-save" id="btn-add-key" onclick="addCredential()">Add API Key</button>
         </div>
+      </div>
+    </section>
+
+    <!-- === KILL SWITCH === -->
+    <section>
+      <div class="section-title">Emergency Controls</div>
+      <div class="killswitch-panel">
+        <div class="killswitch-header">
+          <span class="killswitch-title">KILL SWITCH</span>
+          <span id="ks-status-badge" class="badge-running-ks">RUNNING</span>
+          <button class="btn-killswitch" id="btn-kill" onclick="engageKillSwitch()">ENGAGE KILL SWITCH</button>
+        </div>
+        <div class="killswitch-desc">
+          Immediately engages SAFE_HALT (stops all trading) and revokes all exchange API credentials.
+          This action cannot be undone automatically — re-entry of new API keys is required to resume.
+        </div>
+        <div id="ks-error" class="error-text" style="display:none"></div>
       </div>
     </section>
 
@@ -719,7 +823,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     await authenticate(initData);
     showApp();
-    await Promise.all([fetchStatus(), fetchCandidates(), fetchCredentials()]);
+    await Promise.all([fetchStatus(), fetchCandidates(), fetchCredentials(), fetchKillSwitchStatus()]);
     startPolling();
   } catch (e) {
     showAuthError(e.message);
@@ -783,7 +887,7 @@ function startPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = setInterval(async () => {
     if (state.demoMode) { loadDemoData(); return; }
-    try { await Promise.all([fetchStatus(), fetchCandidates()]); } catch(_) {}
+    try { await Promise.all([fetchStatus(), fetchCandidates(), fetchKillSwitchStatus()]); } catch(_) {}
   }, 5000);
 }
 
@@ -1093,8 +1197,13 @@ async function addCredential() {
   btn.textContent = 'Adding…';
 
   const idemKey = crypto.randomUUID();
+  // Collect optional 2FA code — never logged.
+  const twoFaCode = (document.getElementById('key-2fa-code') || {}).value || '';
+
   try {
-    const res = await apiFetch('POST', '/api/credentials', { exchange, kind, apiKey, apiSecret, passphrase }, idemKey);
+    const extraHeaders = {};
+    if (twoFaCode.trim()) extraHeaders['X-2FA-Code'] = twoFaCode.trim();
+    const res = await apiFetchWithHeaders('POST', '/api/credentials', { exchange, kind, apiKey, apiSecret, passphrase }, idemKey, extraHeaders);
     addNotification('info', 'API key added: ' + exchange + '/' + kind + ' fp=' + (res && res.fingerprint ? res.fingerprint : '?'));
     clearKeyForm();
     await fetchCredentials();
@@ -1133,6 +1242,116 @@ function clearKeyForm() {
   document.getElementById('key-apikey').value = '';
   document.getElementById('key-apisecret').value = '';
   document.getElementById('key-passphrase').value = '';
+  const c = document.getElementById('key-2fa-code');
+  if (c) c.value = '';
+}
+
+// ============================================================
+// Kill Switch
+// ============================================================
+
+async function fetchKillSwitchStatus() {
+  if (state.demoMode) return;
+  try {
+    const res = await apiFetch('GET', '/api/killswitch');
+    updateKillSwitchBadge(res);
+  } catch(e) {
+    // non-fatal; status badge stays as-is
+  }
+}
+
+function updateKillSwitchBadge(res) {
+  const badge = document.getElementById('ks-status-badge');
+  const btn   = document.getElementById('btn-kill');
+  if (!badge || !res) return;
+  if (res.halted) {
+    badge.className = 'badge-halted';
+    badge.textContent = 'HALTED';
+    if (btn) { btn.disabled = true; btn.textContent = 'HALTED'; }
+  } else {
+    badge.className = 'badge-running-ks';
+    badge.textContent = 'RUNNING';
+    if (btn) { btn.disabled = false; btn.textContent = 'ENGAGE KILL SWITCH'; }
+  }
+}
+
+async function engageKillSwitch() {
+  const errEl = document.getElementById('ks-error');
+  errEl.style.display = 'none';
+
+  // Confirm dialog — do NOT embed the typed reason in the confirm message to
+  // avoid leaking it through browser history; we ask the user to type it next.
+  if (!confirm('WARNING: This will stop ALL trading and revoke ALL exchange API keys.\n\nAre you absolutely sure?')) {
+    return;
+  }
+
+  // Prompt for reason (not logged by the server per section 27).
+  const reason = prompt('Enter reason for emergency stop (kept confidential):');
+  if (reason === null) return; // user cancelled
+
+  if (state.demoMode) {
+    updateKillSwitchBadge({ halted: true });
+    addNotification('error', 'DEMO: Kill switch engaged');
+    return;
+  }
+
+  // Optionally prompt for 2FA code.
+  let twoFaCode = '';
+  const twoFaInput = document.getElementById('ks-2fa-code');
+  if (twoFaInput && twoFaInput.value.trim()) {
+    twoFaCode = twoFaInput.value.trim();
+  } else {
+    const entered = prompt('Enter 2FA code (leave blank if not required):');
+    twoFaCode = entered || '';
+  }
+
+  const btn = document.getElementById('btn-kill');
+  btn.disabled = true;
+  btn.textContent = 'Engaging…';
+
+  const idemKey = crypto.randomUUID();
+  try {
+    const headers = {};
+    if (twoFaCode) {
+      // Pass code via dedicated header; never put it in JSON body or logs.
+      headers['X-2FA-Code'] = twoFaCode;
+    }
+    const res = await apiFetchWithHeaders('POST', '/api/killswitch', { reason }, idemKey, headers);
+    updateKillSwitchBadge({ halted: true });
+    addNotification('error', 'Kill switch engaged — trading halted');
+  } catch(e) {
+    errEl.textContent = 'Kill switch failed: ' + e.message;
+    errEl.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'ENGAGE KILL SWITCH';
+  }
+}
+
+// apiFetchWithHeaders — like apiFetch but merges extra headers.
+// 2FA codes passed here MUST NOT be logged.
+async function apiFetchWithHeaders(method, path, body, idemKey, extraHeaders) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  if (idemKey)    headers['X-Idempotency-Key'] = idemKey;
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) {
+      headers[k] = v;
+    }
+  }
+  const opts = { method, headers };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const resp = await fetch(path, opts);
+  if (resp.status === 401) {
+    state.token = null;
+    throw new Error('Session expired — please reopen the Mini App');
+  }
+  if (!resp.ok) {
+    let err = 'HTTP ' + resp.status;
+    try { const j = await resp.json(); err = j.error || err; } catch(_) {}
+    throw new Error(err);
+  }
+  if (resp.status === 204) return null;
+  return resp.json();
 }
 
 // ============================================================

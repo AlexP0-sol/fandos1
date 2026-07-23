@@ -794,23 +794,10 @@ func parsePriceLevels(raw [][]string) ([]domain.PriceLevel, error) {
 }
 
 // ============================================================
-// WS — TODO:VERIFY (bullet-token flow не реализован)
+// WS — реализовано в ws.go
 // ============================================================
 
-// SubscribePublic — WebSocket публичные каналы.
-// TODO:VERIFY: KuCoin WS требует bullet-token (POST /api/v1/bullet-public).
-// Реализация полного WS-flow не включена; возвращает ErrWSNotImplemented.
-func (a *Adapter) SubscribePublic(ctx context.Context, subs []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
-	return nil, fmt.Errorf("kucoin SubscribePublic: %w: TODO:VERIFY bullet-token flow", errWSNotImplemented)
-}
-
-// SubscribePrivate — WebSocket приватные каналы.
-// TODO:VERIFY: требует bullet-token (POST /api/v1/bullet-private) + auth.
-func (a *Adapter) SubscribePrivate(ctx context.Context, creds domain.CredentialRef) (<-chan exchange.PrivateEvent, error) {
-	return nil, fmt.Errorf("kucoin SubscribePrivate: %w: TODO:VERIFY bullet-token flow", errWSNotImplemented)
-}
-
-// errWSNotImplemented — WS не реализован (bullet-token TODO:VERIFY).
+// errWSNotImplemented — WS-функциональность не реализована (используется заглушкой SubscribePrivate).
 var errWSNotImplemented = errors.New("kucoin: WebSocket not implemented")
 
 // ============================================================

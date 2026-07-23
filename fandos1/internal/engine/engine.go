@@ -48,6 +48,7 @@ type Deps struct {
 	Positions *repository.PositionRepo
 	Persister portfolio.Persister
 	Orders    *repository.OrderRepo
+	Legs      *repository.LegsRepo // персист объёмов по ногам (может быть nil в тестах)
 	Halter    Halter
 	Notifier  Notifier // может быть nil
 	Log       *slog.Logger
@@ -155,10 +156,54 @@ func (e *Engine) Restore(ctx context.Context) error {
 			longEx: snap.LongExchange, shortEx: snap.ShortExchange,
 		}
 		e.resolveSymbols(op)
+		// Точный сплит ног из position_legs (в positions хранится только нетто-дельта).
+		if e.deps.Legs != nil && !snap.State.IsTerminal() {
+			if legs, lerr := e.deps.Legs.Load(ctx, snap.ID); lerr == nil && legs.Found {
+				if qerr := p.SetQuantities(legs.LongBaseQty, legs.ShortBaseQty, e.deps.Clock()); qerr != nil {
+					e.deps.Log.Warn("restore leg quantities", "position_id", string(snap.ID), "err", qerr.Error())
+				}
+			} else if lerr != nil {
+				e.deps.Log.Warn("load legs on restore", "position_id", string(snap.ID), "err", lerr.Error())
+			}
+		}
 		e.open[snap.ID] = op
-		e.deps.Log.Info("position restored", "position_id", string(snap.ID), "state", string(snap.State))
+		rs := p.Snapshot()
+		e.deps.Log.Info("position restored", "position_id", string(snap.ID), "state", string(snap.State),
+			"long_qty", rs.LongBaseQty.String(), "short_qty", rs.ShortBaseQty.String())
 	}
 	return nil
+}
+
+// persistLegs записывает текущие объёмы обеих ног в position_legs (nil-safe).
+// Вызывается после каждого изменения объёмов (открытие, repair, закрытие).
+func (e *Engine) persistLegs(ctx context.Context, op *openPosition) {
+	if e.deps.Legs == nil {
+		return
+	}
+	snap := op.pos.Snapshot()
+	legs := []repository.LegState{
+		{PositionID: snap.ID, Side: domain.SideLong, Exchange: op.longEx, Symbol: op.longSym,
+			BaseQty: snap.LongBaseQty, Status: legStatus(snap.State)},
+		{PositionID: snap.ID, Side: domain.SideShort, Exchange: op.shortEx, Symbol: op.shortSym,
+			BaseQty: snap.ShortBaseQty, Status: legStatus(snap.State)},
+	}
+	for _, l := range legs {
+		if err := e.deps.Legs.Upsert(ctx, l); err != nil {
+			e.deps.Log.Warn("persist leg", "position_id", string(snap.ID), "side", string(l.Side), "err", err.Error())
+		}
+	}
+}
+
+// legStatus маппит состояние позиции в статус ноги для БД.
+func legStatus(s portfolio.State) string {
+	switch s {
+	case portfolio.StateClosed:
+		return "closed"
+	case portfolio.StateDegraded:
+		return "degraded"
+	default:
+		return "open"
+	}
 }
 
 // resolveSymbols дополняет openPosition символами/тиком из реестра (идемпотентно).
@@ -301,6 +346,7 @@ func (e *Engine) closePosition(ctx context.Context, op *openPosition, reason str
 	if qerr := op.pos.SetQuantities(newLong, newShort, e.deps.Clock()); qerr != nil {
 		log.Error("set quantities after close failed", "err", qerr.Error())
 	}
+	e.persistLegs(ctx, op) // остатки ног после закрытия в БД
 
 	switch {
 	case err == nil:
@@ -470,6 +516,7 @@ func (e *Engine) openPosition(ctx context.Context, cand *scanner.Candidate) {
 	// Неопределённое состояние ЛЮБОЙ ноги при входе → DEGRADED + стоп (раздел 10.2).
 	if longRes.ambiguous || shortRes.ambiguous {
 		_ = transition(portfolio.StateDegraded, "entry leg state unknown (ack+query timeout)")
+		e.persistLegs(ctx, op)
 		e.registerOpen(id, op)
 		e.notify(ctx, "CRITICAL", fmt.Sprintf("позиция %s: неопределённое состояние ноги при входе", id))
 		return
@@ -499,6 +546,7 @@ func (e *Engine) openPosition(ctx context.Context, cand *scanner.Candidate) {
 		diff := longFilled.Sub(shortFilled).Abs()
 		if diff.GreaterThan(e.cfg.DeltaToleranceBase) || (longFilled.IsZero() && shortFilled.IsZero()) {
 			_ = transition(portfolio.StateDegraded, "delta mismatch not repaired")
+			e.persistLegs(ctx, op)
 			e.registerOpen(id, op)
 			e.notify(ctx, "CRITICAL", fmt.Sprintf("позиция %s: дельта не выровнена (long=%s short=%s)",
 				id, longFilled.String(), shortFilled.String()))
@@ -512,6 +560,7 @@ func (e *Engine) openPosition(ctx context.Context, cand *scanner.Candidate) {
 	if !transition(portfolio.StateMonitoring, "entering monitoring") {
 		return
 	}
+	e.persistLegs(ctx, op) // точный сплит ног в БД (переживёт рестарт)
 	e.registerOpen(id, op)
 	log.Info("position opened",
 		"long", string(op.longEx), "short", string(op.shortEx),

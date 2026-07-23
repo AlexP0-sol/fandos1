@@ -1491,25 +1491,19 @@ func (a *Adapter) GetNetworkInfo(ctx context.Context, asset string) ([]domain.Ne
 }
 
 // ============================================================
-// WS — TODO:VERIFY полная реализация
+// WS
 // ============================================================
 
-// SubscribePublic — TODO:VERIFY: Bitget V2 WS channels format.
-// Возвращает ErrWSNotImplemented. REST полный, WS — следующий этап.
-func (a *Adapter) SubscribePublic(ctx context.Context, subscriptions []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
-	// TODO:VERIFY: Bitget V2 WS public URL wss://ws.bitget.com/v2/ws/public
-	// TODO: реализовать полный WS subscriber по образцу bybit/ws.go
-	return nil, fmt.Errorf("bitget SubscribePublic: %w", errWSNotImplemented)
-}
+// SubscribePublic is implemented in ws.go.
 
 // SubscribePrivate — TODO:VERIFY: Bitget V2 WS private auth format.
 func (a *Adapter) SubscribePrivate(ctx context.Context, credentials domain.CredentialRef) (<-chan exchange.PrivateEvent, error) {
 	// TODO:VERIFY: Bitget V2 WS private URL wss://ws.bitget.com/v2/ws/private
-	// TODO: реализовать приватный WS subscriber
+	// TODO: implement private WS subscriber (auth format not yet verified)
 	return nil, fmt.Errorf("bitget SubscribePrivate: %w", errWSNotImplemented)
 }
 
-// errWSNotImplemented — WS ещё не реализован.
+// errWSNotImplemented — private WS not yet implemented.
 var errWSNotImplemented = errors.New("bitget: WebSocket not implemented")
 
 // ============================================================

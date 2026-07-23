@@ -1310,25 +1310,7 @@ func (a *Adapter) GetADLState(_ context.Context, symbol domain.ExchangeSymbol) (
 	}, nil
 }
 
-// ============================================================
-// WebSocket — TODO:VERIFY (типизированная заглушка)
-// ============================================================
-
-// errWSNotImplemented — WS не реализован в этой версии.
-var errWSNotImplemented = errors.New("mexc: WebSocket не реализован; используйте REST polling")
-
-// SubscribePublic — TODO:VERIFY WS endpoint wss://contract.mexc.com/edge.
-func (a *Adapter) SubscribePublic(_ context.Context, _ []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
-	// TODO:VERIFY: WS base URL wss://contract.mexc.com/edge (подтверждено в docs 2024-01-31).
-	// Каналы: sub.ticker, sub.depth (TODO:VERIFY формат сообщений).
-	return nil, errWSNotImplemented
-}
-
-// SubscribePrivate — TODO:VERIFY приватные WS каналы MEXC.
-func (a *Adapter) SubscribePrivate(_ context.Context, _ domain.CredentialRef) (<-chan exchange.PrivateEvent, error) {
-	// TODO:VERIFY: приватная WS аутентификация и каналы MEXC.
-	return nil, errWSNotImplemented
-}
+// SubscribePublic и SubscribePrivate реализованы в ws.go.
 
 // ============================================================
 // Transfers — TODO:VERIFY (Spot API)

@@ -65,8 +65,8 @@
 //   - LOW    — иначе
 //
 // WS:
-//   - SubscribePublic/SubscribePrivate: не реализованы, возвращают ErrWSNotImplemented.
-//   - TODO: реализовать WS wss://ws.okx.com:8443/ws/v5/public (tickers/books5 channels).
+//   - SubscribePublic: реализован в ws.go (tickers + funding-rate каналы).
+//   - SubscribePrivate: не реализован, возвращает ErrWSNotImplemented.
 package okx
 
 import (
@@ -854,11 +854,7 @@ func parsePriceLevels(raw [][]string) ([]domain.PriceLevel, error) {
 // WebSocket — не реализованы (ErrWSNotImplemented)
 // ============================================================
 
-// SubscribePublic возвращает ErrWSNotImplemented.
-// TODO: реализовать WS wss://ws.okx.com:8443/ws/v5/public (tickers/books5 channels).
-func (a *Adapter) SubscribePublic(_ context.Context, _ []exchange.PublicSubscription) (<-chan exchange.PublicEvent, error) {
-	return nil, ErrWSNotImplemented
-}
+// SubscribePublic реализован в ws.go (OKX V5 public WS: tickers + funding-rate).
 
 // SubscribePrivate возвращает ErrWSNotImplemented.
 // TODO: реализовать приватный WS с login-frame (apiKey/passphrase/timestamp/sign).

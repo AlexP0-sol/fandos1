@@ -984,22 +984,17 @@ func TestSetPositionMode_OneWay(t *testing.T) {
 }
 
 // ============================================================
-// SubscribePublic — должен возвращать ошибку (WS не реализован)
+// SubscribePublic — WS теперь реализован; проверяем что пустой список вернёт ошибку
 // ============================================================
 
-func TestSubscribePublic_NotImplemented(t *testing.T) {
+func TestSubscribePublic_EmptySubsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 
 	a, _ := mkAdapter(srv)
-	_, err := a.SubscribePublic(context.Background(), []exchange.PublicSubscription{
-		{Channel: exchange.ChannelTicker, Symbol: "BTCUSDT"},
-	})
+	_, err := a.SubscribePublic(context.Background(), nil)
 	if err == nil {
-		t.Fatal("expected error for unimplemented WS")
-	}
-	if !errors.Is(err, errWSNotImplemented) {
-		t.Errorf("expected errWSNotImplemented, got: %v", err)
+		t.Fatal("expected error for empty subscriptions")
 	}
 }
 

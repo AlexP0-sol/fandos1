@@ -106,6 +106,7 @@ func run() error {
 		Positions: boot.Positions,
 		Persister: repository.NewPersister(boot.Pool),
 		Orders:    boot.Orders,
+		Legs:      repository.NewLegsRepo(boot.Pool),
 		Halter:    boot.Halter,
 		Log:       log,
 		Clock:     time.Now,

@@ -184,6 +184,50 @@ type OwnerClaimer interface {
 	ClaimOwner(ctx context.Context, telegramID int64) (bool, error)
 }
 
+// ============================================================
+// Kill-switch interfaces (раздел 27)
+// ============================================================
+
+// KillSwitchProvider — провайдер аварийной остановки (section 27).
+// Engage engages SAFE_HALT and revokes all credentials.
+// Status returns whether SAFE_HALT is currently active.
+type KillSwitchProvider interface {
+	// Engage triggers SAFE_HALT + best-effort credential revoke.
+	// reason MUST NOT be logged.
+	Engage(ctx context.Context, reason string) error
+	// Status returns current halted state and reason.
+	Status(ctx context.Context) (halted bool, reason string, err error)
+}
+
+// TwoFactorVerifier — second-factor check (section 27.3).
+// A nil verifier means 2FA is disabled (dev/test mode).
+type TwoFactorVerifier interface {
+	// Verify returns true if code is valid for userID.
+	// The code value MUST NOT be logged by any caller.
+	Verify(ctx context.Context, userID int64, code string) (bool, error)
+}
+
+// MemorySharedSecretVerifier is a stub TwoFactorVerifier that compares
+// the submitted code against a single shared secret.  For development only.
+// A real TOTP / Telegram-confirm implementation should replace this.
+type MemorySharedSecretVerifier struct {
+	Secret string // shared secret expected as the "2FA code"
+}
+
+// Verify returns true when code equals the shared secret.
+// The code is compared in constant time to prevent timing attacks.
+func (v *MemorySharedSecretVerifier) Verify(_ context.Context, _ int64, code string) (bool, error) {
+	// constant-time comparison via XOR length check + byte loop
+	if len(code) != len(v.Secret) {
+		return false, nil
+	}
+	diff := byte(0)
+	for i := 0; i < len(code); i++ {
+		diff |= code[i] ^ v.Secret[i]
+	}
+	return diff == 0, nil
+}
+
 // VersionConflictError — ошибка конфликта версии настроек (→ HTTP 409).
 var VersionConflictError = errors.New("settings: version conflict")
 
@@ -255,6 +299,8 @@ type Handler struct {
 	closer      CloseRequester
 	credentials CredentialsProvider
 	owner       OwnerClaimer
+	killSwitch  KillSwitchProvider
+	twoFactor   TwoFactorVerifier
 	mux         *http.ServeMux
 }
 
@@ -268,6 +314,10 @@ type HandlerDeps struct {
 	Closer      CloseRequester
 	Credentials CredentialsProvider
 	Owner       OwnerClaimer
+	// KillSwitch — аварийная остановка (section 27). nil → 501.
+	KillSwitch KillSwitchProvider
+	// TwoFactor — второй фактор аутентификации (section 27.3). nil = disabled.
+	TwoFactor TwoFactorVerifier
 }
 
 // NewHandler создаёт Handler и регистрирует маршруты.
@@ -300,6 +350,8 @@ func NewHandler(apiCfg APIConfig, botCfg Config, deps HandlerDeps) *Handler {
 		closer:      deps.Closer,
 		credentials: deps.Credentials,
 		owner:       deps.Owner,
+		killSwitch:  deps.KillSwitch,
+		twoFactor:   deps.TwoFactor,
 		mux:         http.NewServeMux(),
 	}
 	h.registerRoutes()
@@ -328,8 +380,12 @@ func (h *Handler) registerRoutes() {
 
 	// Маршруты управления API-ключами (раздел 13).
 	h.mux.Handle("GET /api/credentials", h.authMiddleware(http.HandlerFunc(h.handleListCredentials)))
-	h.mux.Handle("POST /api/credentials", h.authMiddleware(h.idemMiddleware("credentials", http.HandlerFunc(h.handleSaveCredential))))
+	h.mux.Handle("POST /api/credentials", h.authMiddleware(h.idemMiddleware("credentials", h.twoFactorMiddleware(http.HandlerFunc(h.handleSaveCredential)))))
 	h.mux.Handle("DELETE /api/credentials/{exchange}/{kind}", h.authMiddleware(http.HandlerFunc(h.handleRevokeCredential)))
+
+	// Kill-switch (раздел 27).
+	h.mux.Handle("POST /api/killswitch", h.authMiddleware(h.idemMiddleware("killswitch", h.twoFactorMiddleware(http.HandlerFunc(h.handleKillSwitchEngage)))))
+	h.mux.Handle("GET /api/killswitch", h.authMiddleware(http.HandlerFunc(h.handleKillSwitchStatus)))
 }
 
 // ============================================================
@@ -377,6 +433,37 @@ func (h *Handler) idemMiddleware(scope string, next http.Handler) http.Handler {
 		}
 		if seen {
 			writeError(w, http.StatusConflict, "повтор idempotency key — запрос уже обработан")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// twoFactorMiddleware — проверяет заголовок X-2FA-Code (section 27.3).
+// When TwoFactor verifier is nil (dev mode) the check is skipped entirely.
+// The code value is NEVER logged.
+func (h *Handler) twoFactorMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.twoFactor == nil {
+			// 2FA disabled — allow through.
+			next.ServeHTTP(w, r)
+			return
+		}
+		code := r.Header.Get("X-2FA-Code")
+		if code == "" {
+			writeError(w, http.StatusUnauthorized, "заголовок X-2FA-Code обязателен")
+			return
+		}
+		userID, _ := r.Context().Value(ctxUserID).(int64)
+		ok, err := h.twoFactor.Verify(r.Context(), userID, code)
+		if err != nil {
+			// Do NOT expose internal details; code is not logged.
+			slog.Error("telegram: 2FA verify error")
+			writeError(w, http.StatusInternalServerError, "ошибка проверки 2FA")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusForbidden, "неверный код 2FA")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -742,6 +829,66 @@ func (h *Handler) handleRevokeCredential(w http.ResponseWriter, r *http.Request)
 
 	slog.Info("telegram: credentials revoke: успешно", "exchange", exchange, "kind", kind)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ============================================================
+// Kill-switch handlers (section 27)
+// ============================================================
+
+// killSwitchEngageRequest — тело POST /api/killswitch.
+type killSwitchEngageRequest struct {
+	// Reason is intentionally not logged anywhere in this handler.
+	Reason string `json:"reason"`
+}
+
+// killSwitchStatusResponse — ответ GET /api/killswitch.
+type killSwitchStatusResponse struct {
+	Halted bool   `json:"halted"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// handleKillSwitchEngage — POST /api/killswitch (auth + idem + 2FA).
+// Engages SAFE_HALT and revokes all credentials.
+// reason is NEVER logged.
+func (h *Handler) handleKillSwitchEngage(w http.ResponseWriter, r *http.Request) {
+	if h.killSwitch == nil {
+		writeError(w, http.StatusNotImplemented, "kill-switch provider не подключён")
+		return
+	}
+
+	var req killSwitchEngageRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
+		return
+	}
+
+	userID, _ := r.Context().Value(ctxUserID).(int64)
+	// Intentional: reason and userID are logged separately, reason value is NEVER included.
+	slog.Info("telegram: kill-switch engage requested", "user_id", userID)
+
+	if err := h.killSwitch.Engage(r.Context(), req.Reason); err != nil {
+		slog.Error("telegram: kill-switch engage error")
+		writeError(w, http.StatusInternalServerError, "ошибка активации kill-switch")
+		return
+	}
+
+	slog.Warn("telegram: kill-switch engaged", "user_id", userID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "halted"})
+}
+
+// handleKillSwitchStatus — GET /api/killswitch.
+func (h *Handler) handleKillSwitchStatus(w http.ResponseWriter, r *http.Request) {
+	if h.killSwitch == nil {
+		writeError(w, http.StatusNotImplemented, "kill-switch provider не подключён")
+		return
+	}
+	halted, reason, err := h.killSwitch.Status(r.Context())
+	if err != nil {
+		slog.Error("telegram: kill-switch status error", "err", err)
+		writeError(w, http.StatusInternalServerError, "ошибка получения статуса kill-switch")
+		return
+	}
+	writeJSON(w, http.StatusOK, killSwitchStatusResponse{Halted: halted, Reason: reason})
 }
 
 // ============================================================
