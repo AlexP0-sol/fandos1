@@ -156,6 +156,34 @@ type CloseRequester interface {
 	RequestClose(ctx context.Context, positionID string) error
 }
 
+// CredentialDTO — метаданные одного API-ключа для отображения в UI (без секретов).
+type CredentialDTO struct {
+	Exchange    string    `json:"exchange"`
+	Kind        string    `json:"kind"`
+	Fingerprint string    `json:"fingerprint"`
+	CreatedAt   time.Time `json:"createdAt"`
+	Revoked     bool      `json:"revoked"`
+}
+
+// CredentialsProvider — провайдер управления API-ключами бирж.
+// Шифрование выполняет app-провайдер; telegram-пакет — только транспорт.
+type CredentialsProvider interface {
+	// List возвращает список API-ключей пользователя без секретов.
+	List(ctx context.Context) ([]CredentialDTO, error)
+	// Save шифрует и сохраняет API-ключ. Возвращает fingerprint.
+	// passphrase необязательна (OKX/Bitget/KuCoin требуют её, остальные — нет).
+	Save(ctx context.Context, exchange, kind, apiKey, apiSecret, passphrase string) (fingerprint string, err error)
+	// Revoke отзывает API-ключ по паре (exchange, kind).
+	Revoke(ctx context.Context, exchange, kind string) error
+}
+
+// OwnerClaimer — интерфейс автоматического клейма владельца при первом входе.
+type OwnerClaimer interface {
+	// ClaimOwner атомарно устанавливает telegram_id владельца.
+	// Возвращает true если клейм успешен (был placeholder -1).
+	ClaimOwner(ctx context.Context, telegramID int64) (bool, error)
+}
+
 // VersionConflictError — ошибка конфликта версии настроек (→ HTTP 409).
 var VersionConflictError = errors.New("settings: version conflict")
 
@@ -217,25 +245,29 @@ const defaultSessionTTL = 24 * time.Hour
 
 // Handler — mux + зависимости для HTTP API.
 type Handler struct {
-	cfg        APIConfig
-	botCfg     Config
-	sessions   *SessionManager
-	idem       IdemStore
-	status     StatusProvider
-	candidates CandidatesProvider
-	settings   SettingsProvider
-	closer     CloseRequester
-	mux        *http.ServeMux
+	cfg         APIConfig
+	botCfg      Config
+	sessions    *SessionManager
+	idem        IdemStore
+	status      StatusProvider
+	candidates  CandidatesProvider
+	settings    SettingsProvider
+	closer      CloseRequester
+	credentials CredentialsProvider
+	owner       OwnerClaimer
+	mux         *http.ServeMux
 }
 
 // HandlerDeps — зависимости Handler (опциональные компоненты).
 type HandlerDeps struct {
-	Sessions   *SessionManager
-	Idem       IdemStore
-	Status     StatusProvider
-	Candidates CandidatesProvider
-	Settings   SettingsProvider
-	Closer     CloseRequester
+	Sessions    *SessionManager
+	Idem        IdemStore
+	Status      StatusProvider
+	Candidates  CandidatesProvider
+	Settings    SettingsProvider
+	Closer      CloseRequester
+	Credentials CredentialsProvider
+	Owner       OwnerClaimer
 }
 
 // NewHandler создаёт Handler и регистрирует маршруты.
@@ -258,15 +290,17 @@ func NewHandler(apiCfg APIConfig, botCfg Config, deps HandlerDeps) *Handler {
 	}
 
 	h := &Handler{
-		cfg:        apiCfg,
-		botCfg:     botCfg,
-		sessions:   sessions,
-		idem:       idem,
-		status:     deps.Status,
-		candidates: deps.Candidates,
-		settings:   deps.Settings,
-		closer:     deps.Closer,
-		mux:        http.NewServeMux(),
+		cfg:         apiCfg,
+		botCfg:      botCfg,
+		sessions:    sessions,
+		idem:        idem,
+		status:      deps.Status,
+		candidates:  deps.Candidates,
+		settings:    deps.Settings,
+		closer:      deps.Closer,
+		credentials: deps.Credentials,
+		owner:       deps.Owner,
+		mux:         http.NewServeMux(),
 	}
 	h.registerRoutes()
 	return h
@@ -291,6 +325,11 @@ func (h *Handler) registerRoutes() {
 	h.mux.Handle("GET /api/settings", h.authMiddleware(http.HandlerFunc(h.handleGetSettings)))
 	h.mux.Handle("PUT /api/settings", h.authMiddleware(h.idemMiddleware("settings", http.HandlerFunc(h.handlePutSettings))))
 	h.mux.Handle("POST /api/positions/{id}/close", h.authMiddleware(h.idemMiddleware("positions.close", http.HandlerFunc(h.handlePositionClose))))
+
+	// Маршруты управления API-ключами (раздел 13).
+	h.mux.Handle("GET /api/credentials", h.authMiddleware(http.HandlerFunc(h.handleListCredentials)))
+	h.mux.Handle("POST /api/credentials", h.authMiddleware(h.idemMiddleware("credentials", http.HandlerFunc(h.handleSaveCredential))))
+	h.mux.Handle("DELETE /api/credentials/{exchange}/{kind}", h.authMiddleware(http.HandlerFunc(h.handleRevokeCredential)))
 }
 
 // ============================================================
@@ -442,6 +481,16 @@ func (h *Handler) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Если провайдер claimOwner подключён — пробуем захватить владельца.
+	if h.owner != nil {
+		claimed, claimErr := h.owner.ClaimOwner(r.Context(), result.User.ID)
+		if claimErr != nil {
+			slog.Warn("telegram: auth: ошибка ClaimOwner", "err", claimErr)
+		} else if claimed {
+			slog.Info("telegram: auth: владелец успешно зарегистрирован", "telegram_id", result.User.ID)
+		}
+	}
+
 	slog.Info("telegram: auth: успешный вход", "user_id", result.User.ID)
 
 	writeJSON(w, http.StatusOK, AuthResponse{
@@ -565,6 +614,134 @@ func (h *Handler) handlePositionClose(w http.ResponseWriter, r *http.Request) {
 		"status":     "accepted",
 		"positionId": positionID,
 	})
+}
+
+// ============================================================
+// Credentials handlers
+// ============================================================
+
+// handleListCredentials — GET /api/credentials.
+// Возвращает список API-ключей пользователя (без секретов).
+func (h *Handler) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	if h.credentials == nil {
+		writeError(w, http.StatusNotImplemented, "credentials provider не подключён")
+		return
+	}
+	items, err := h.credentials.List(r.Context())
+	if err != nil {
+		slog.Error("telegram: credentials list: ошибка", "err", err)
+		writeError(w, http.StatusInternalServerError, "ошибка получения списка ключей")
+		return
+	}
+	if items == nil {
+		items = []CredentialDTO{}
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// saveCredentialRequest — тело POST /api/credentials.
+type saveCredentialRequest struct {
+	Exchange   string `json:"exchange"`
+	Kind       string `json:"kind"`
+	APIKey     string `json:"apiKey"`
+	APISecret  string `json:"apiSecret"`
+	Passphrase string `json:"passphrase"`
+}
+
+// saveCredentialResponse — ответ POST /api/credentials.
+type saveCredentialResponse struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
+// handleSaveCredential — POST /api/credentials (требует X-Idempotency-Key).
+// Тело: {exchange, kind, apiKey, apiSecret, passphrase?}.
+// Валидация: exchange ∈ domain.SupportedExchanges(), kind ∈ trade|withdrawal,
+// apiKey/apiSecret непустые и ≤512 символов.
+// Секреты НИКОГДА не попадают в логи/ошибки/ответы.
+func (h *Handler) handleSaveCredential(w http.ResponseWriter, r *http.Request) {
+	if h.credentials == nil {
+		writeError(w, http.StatusNotImplemented, "credentials provider не подключён")
+		return
+	}
+
+	var req saveCredentialRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
+		return
+	}
+
+	// Валидация exchange.
+	if !domain.ExchangeID(req.Exchange).IsValid() {
+		writeError(w, http.StatusBadRequest, "неподдерживаемая биржа: "+req.Exchange)
+		return
+	}
+
+	// Валидация kind.
+	if req.Kind != "trade" && req.Kind != "withdrawal" {
+		writeError(w, http.StatusBadRequest, "kind должен быть 'trade' или 'withdrawal'")
+		return
+	}
+
+	// Валидация apiKey (не пустой, ≤512).
+	if req.APIKey == "" {
+		writeError(w, http.StatusBadRequest, "apiKey обязателен")
+		return
+	}
+	if len(req.APIKey) > 512 {
+		writeError(w, http.StatusBadRequest, "apiKey слишком длинный (макс. 512 символов)")
+		return
+	}
+
+	// Валидация apiSecret (не пустой, ≤512).
+	if req.APISecret == "" {
+		writeError(w, http.StatusBadRequest, "apiSecret обязателен")
+		return
+	}
+	if len(req.APISecret) > 512 {
+		writeError(w, http.StatusBadRequest, "apiSecret слишком длинный (макс. 512 символов)")
+		return
+	}
+
+	// Сохраняем. Секреты не логируем.
+	fingerprint, err := h.credentials.Save(r.Context(), req.Exchange, req.Kind, req.APIKey, req.APISecret, req.Passphrase)
+	if err != nil {
+		slog.Error("telegram: credentials save: ошибка", "exchange", req.Exchange, "kind", req.Kind)
+		writeError(w, http.StatusInternalServerError, "ошибка сохранения ключа")
+		return
+	}
+
+	slog.Info("telegram: credentials save: успешно", "exchange", req.Exchange, "kind", req.Kind, "fingerprint", fingerprint)
+	writeJSON(w, http.StatusCreated, saveCredentialResponse{Fingerprint: fingerprint})
+}
+
+// handleRevokeCredential — DELETE /api/credentials/{exchange}/{kind}.
+// Возвращает 204 при успехе.
+func (h *Handler) handleRevokeCredential(w http.ResponseWriter, r *http.Request) {
+	if h.credentials == nil {
+		writeError(w, http.StatusNotImplemented, "credentials provider не подключён")
+		return
+	}
+
+	exchange := r.PathValue("exchange")
+	kind := r.PathValue("kind")
+
+	if !domain.ExchangeID(exchange).IsValid() {
+		writeError(w, http.StatusBadRequest, "неподдерживаемая биржа: "+exchange)
+		return
+	}
+	if kind != "trade" && kind != "withdrawal" {
+		writeError(w, http.StatusBadRequest, "kind должен быть 'trade' или 'withdrawal'")
+		return
+	}
+
+	if err := h.credentials.Revoke(r.Context(), exchange, kind); err != nil {
+		slog.Error("telegram: credentials revoke: ошибка", "exchange", exchange, "kind", kind, "err", err)
+		writeError(w, http.StatusInternalServerError, "ошибка отзыва ключа")
+		return
+	}
+
+	slog.Info("telegram: credentials revoke: успешно", "exchange", exchange, "kind", kind)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ============================================================

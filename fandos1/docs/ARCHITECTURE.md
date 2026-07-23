@@ -43,6 +43,8 @@ internal/
   strategy/     — funding calendar, ExpectedNetPnL, candidate score         [есть]
   allocation/   — распределение капитала, cross-pair contention (раздел 25) [есть]
   execution/    — coordinator, slices, ack-timeout, partial-fill repair, coordinated close [есть]
+  engine/       — оркестратор цикла: кандидат→вход→repair→HEDGED→MONITORING→close [есть]
+  app/          — DI-обвязка bootstrap, провайдеры Mini App, live-wiring адаптеров [есть]
   risk/         — risk limits, margin, delta, ADL реакция, counterparty risk [есть]
   portfolio/    — агрегированный портфель, PnL, exposure                    [есть]
   rebalance/    — state machine, test/main barrier, circuit breaker         [есть]

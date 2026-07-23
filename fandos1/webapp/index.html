@@ -371,6 +371,94 @@
       border-radius: 3px; padding: 2px 8px;
       color: var(--red); font-size: 10px; font-family: var(--font-mono);
     }
+
+    /* ===== API KEYS ===== */
+    .key-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .key-row:last-child { border-bottom: none; }
+    .key-exch {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: bold;
+      color: var(--text-head);
+      min-width: 60px;
+    }
+    .key-kind {
+      font-size: 11px;
+      color: var(--text-dim);
+      min-width: 70px;
+    }
+    .key-fp {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .key-date {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .badge-revoked {
+      background: #2a0a0a; border: 1px solid var(--red-dim);
+      border-radius: 3px; padding: 1px 6px;
+      color: var(--red); font-size: 10px; font-family: var(--font-mono);
+    }
+    .badge-active {
+      background: #0a2a1a; border: 1px solid var(--green-dim);
+      border-radius: 3px; padding: 1px 6px;
+      color: var(--green); font-size: 10px; font-family: var(--font-mono);
+    }
+    .btn-revoke {
+      padding: 3px 9px;
+      border: 1px solid var(--red-dim);
+      border-radius: 4px;
+      background: transparent;
+      color: var(--red);
+      font-size: 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-revoke:hover { background: #2a0a0a; }
+    .btn-revoke:disabled { opacity: 0.4; cursor: default; }
+
+    .key-add-form {
+      margin-top: 12px;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+    .key-add-form .form-row {
+      border-bottom: none;
+      padding: 4px 0;
+    }
+    .key-add-form select,
+    .key-add-form input[type="password"],
+    .key-add-form input[type="text"] {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-head);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 5px 8px;
+      min-width: 0;
+    }
+    .key-add-form select:focus,
+    .key-add-form input:focus { outline: 1px solid var(--accent); }
+    .key-passphrase-note {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
   </style>
 </head>
 <body>
@@ -516,6 +604,61 @@
       </div>
     </section>
 
+    <!-- === API KEYS === -->
+    <section>
+      <div class="section-title" style="display:flex;align-items:center;gap:8px">
+        API Keys
+        <button class="refresh-btn" onclick="fetchCredentials()">refresh</button>
+      </div>
+      <div class="card">
+        <!-- Список ключей -->
+        <div id="keys-list">
+          <div class="empty-state">Loading…</div>
+        </div>
+
+        <!-- Форма добавления -->
+        <div class="key-add-form">
+          <div class="section-title" style="margin-bottom:10px">Add API Key</div>
+          <div class="form-row">
+            <div class="form-label">Exchange</div>
+            <select id="key-exchange" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text-head);font-family:var(--font-mono);font-size:12px;padding:5px 8px">
+              <option value="binance">Binance</option>
+              <option value="bybit">Bybit</option>
+              <option value="mexc">MEXC</option>
+              <option value="okx">OKX</option>
+              <option value="bitget">Bitget</option>
+              <option value="kucoin">KuCoin</option>
+              <option value="gate">Gate</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <div class="form-label">Kind</div>
+            <select id="key-kind" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text-head);font-family:var(--font-mono);font-size:12px;padding:5px 8px">
+              <option value="trade">Trade</option>
+              <option value="withdrawal">Withdrawal</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <div class="form-label">API Key</div>
+            <input class="form-input" id="key-apikey" type="password" autocomplete="new-password" placeholder="API Key" style="width:auto;flex:1;text-align:left">
+          </div>
+          <div class="form-row">
+            <div class="form-label">API Secret</div>
+            <input class="form-input" id="key-apisecret" type="password" autocomplete="new-password" placeholder="API Secret" style="width:auto;flex:1;text-align:left">
+          </div>
+          <div class="form-row">
+            <div class="form-label">
+              Passphrase
+              <div class="key-passphrase-note">Required for OKX / Bitget / KuCoin</div>
+            </div>
+            <input class="form-input" id="key-passphrase" type="password" autocomplete="new-password" placeholder="Passphrase (if required)" style="width:auto;flex:1;text-align:left">
+          </div>
+          <div id="key-add-error" class="error-text" style="display:none"></div>
+          <button class="btn-save" id="btn-add-key" onclick="addCredential()">Add API Key</button>
+        </div>
+      </div>
+    </section>
+
     <!-- === NOTIFICATIONS === -->
     <section>
       <div class="section-title">Recent Notifications</div>
@@ -566,6 +709,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('demo-banner').style.display = 'block';
     showApp();
     loadDemoData();
+    fetchCredentials();
     startPolling();
     return;
   }
@@ -575,7 +719,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     await authenticate(initData);
     showApp();
-    await Promise.all([fetchStatus(), fetchCandidates()]);
+    await Promise.all([fetchStatus(), fetchCandidates(), fetchCredentials()]);
     startPolling();
   } catch (e) {
     showAuthError(e.message);
@@ -855,6 +999,140 @@ async function saveSettings() {
   }
   btn.disabled = false;
   btn.textContent = 'Save Settings';
+}
+
+// ============================================================
+// API Keys (Credentials)
+// ============================================================
+
+// demoCredentials — мок-данные для demo-режима.
+const demoCredentials = [
+  { exchange: 'binance', kind: 'trade',      fingerprint: 'ABCD1234...', createdAt: new Date(Date.now() - 86400000 * 3).toISOString(), revoked: false },
+  { exchange: 'bybit',   kind: 'trade',      fingerprint: 'EF012345...', createdAt: new Date(Date.now() - 86400000).toISOString(),     revoked: false },
+  { exchange: 'okx',     kind: 'trade',      fingerprint: 'GH678901...', createdAt: new Date(Date.now() - 86400000 * 7).toISOString(), revoked: true  },
+];
+
+async function fetchCredentials() {
+  if (state.demoMode) {
+    renderCredentials(demoCredentials);
+    return;
+  }
+  try {
+    const items = await apiFetch('GET', '/api/credentials');
+    renderCredentials(items || []);
+  } catch(e) {
+    document.getElementById('keys-list').innerHTML =
+      '<div class="error-text">Failed to load keys: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function renderCredentials(items) {
+  const el = document.getElementById('keys-list');
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="empty-state">No API keys configured</div>';
+    return;
+  }
+  el.innerHTML = items.map(k => {
+    const dateStr = k.createdAt ? new Date(k.createdAt).toLocaleDateString() : '—';
+    const statusBadge = k.revoked
+      ? '<span class="badge-revoked">REVOKED</span>'
+      : '<span class="badge-active">ACTIVE</span>';
+    const revokeBtn = k.revoked
+      ? '<button class="btn-revoke" disabled>Revoke</button>'
+      : `<button class="btn-revoke" onclick="revokeCredential('${escapeHtml(k.exchange)}','${escapeHtml(k.kind)}',this)">Revoke</button>`;
+    return `<div class="key-row">
+      <span class="key-exch">${escapeHtml(k.exchange.toUpperCase())}</span>
+      <span class="key-kind">${escapeHtml(k.kind)}</span>
+      <span class="key-fp">${escapeHtml(k.fingerprint)}</span>
+      <span class="key-date">${dateStr}</span>
+      ${statusBadge}
+      ${revokeBtn}
+    </div>`;
+  }).join('');
+}
+
+async function addCredential() {
+  const btn = document.getElementById('btn-add-key');
+  const errEl = document.getElementById('key-add-error');
+  errEl.style.display = 'none';
+
+  const exchange   = document.getElementById('key-exchange').value;
+  const kind       = document.getElementById('key-kind').value;
+  const apiKey     = document.getElementById('key-apikey').value;
+  const apiSecret  = document.getElementById('key-apisecret').value;
+  const passphrase = document.getElementById('key-passphrase').value;
+
+  // Клиентская валидация — не логируем значения секретов.
+  if (!apiKey.trim()) {
+    errEl.textContent = 'API Key is required';
+    errEl.style.display = 'block';
+    return;
+  }
+  if (!apiSecret.trim()) {
+    errEl.textContent = 'API Secret is required';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  if (state.demoMode) {
+    // Demo mode — симулируем добавление без реального запроса.
+    demoCredentials.unshift({
+      exchange,
+      kind,
+      fingerprint: apiKey.substring(0, 4) + '...',
+      createdAt:   new Date().toISOString(),
+      revoked:     false,
+    });
+    clearKeyForm();
+    renderCredentials(demoCredentials);
+    addNotification('info', 'Demo: API key added for ' + exchange + '/' + kind);
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+
+  const idemKey = crypto.randomUUID();
+  try {
+    const res = await apiFetch('POST', '/api/credentials', { exchange, kind, apiKey, apiSecret, passphrase }, idemKey);
+    addNotification('info', 'API key added: ' + exchange + '/' + kind + ' fp=' + (res && res.fingerprint ? res.fingerprint : '?'));
+    clearKeyForm();
+    await fetchCredentials();
+  } catch(e) {
+    errEl.textContent = 'Failed to add key: ' + e.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add API Key';
+  }
+}
+
+async function revokeCredential(exchange, kind, btnEl) {
+  if (!confirm('Revoke ' + exchange + '/' + kind + ' API key?')) return;
+
+  if (state.demoMode) {
+    const item = demoCredentials.find(k => k.exchange === exchange && k.kind === kind);
+    if (item) item.revoked = true;
+    renderCredentials(demoCredentials);
+    addNotification('info', 'Demo: API key revoked for ' + exchange + '/' + kind);
+    return;
+  }
+
+  if (btnEl) btnEl.disabled = true;
+  try {
+    await apiFetch('DELETE', '/api/credentials/' + encodeURIComponent(exchange) + '/' + encodeURIComponent(kind));
+    addNotification('info', 'API key revoked: ' + exchange + '/' + kind);
+    await fetchCredentials();
+  } catch(e) {
+    addNotification('error', 'Revoke failed: ' + e.message);
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+function clearKeyForm() {
+  document.getElementById('key-apikey').value = '';
+  document.getElementById('key-apisecret').value = '';
+  document.getElementById('key-passphrase').value = '';
 }
 
 // ============================================================

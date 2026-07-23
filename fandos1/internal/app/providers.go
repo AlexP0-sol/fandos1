@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/thecd/fundarbitrage/internal/config"
+	"github.com/thecd/fundarbitrage/internal/outbox"
 	"github.com/thecd/fundarbitrage/internal/repository"
 	"github.com/thecd/fundarbitrage/internal/scanner"
 	"github.com/thecd/fundarbitrage/internal/telegram"
@@ -155,10 +156,17 @@ func (EmptyCandidatesProvider) Candidates(context.Context) ([]scanner.Candidate,
 	return nil, nil
 }
 
-// LockingCloseRequester — ручное закрытие из Mini App (semi-auto v1):
-// фиксирует запрос в audit_log; исполнение подхватывает worker.
+// LockingCloseRequester — ручное закрытие из Mini App: атомарно (одна
+// транзакция) пишет audit + событие в transactional outbox; worker-диспетчер
+// доставит его движку (engine.RequestClose). Так запрос переживает рестарты.
 type LockingCloseRequester struct {
 	Boot *Bootstrap
+}
+
+// CloseRequestPayload — payload outbox-события close_request.
+type CloseRequestPayload struct {
+	PositionID string `json:"positionId"`
+	Reason     string `json:"reason"`
 }
 
 // RequestClose записывает намерение оператора закрыть позицию.
@@ -171,6 +179,11 @@ func (r *LockingCloseRequester) RequestClose(ctx context.Context, positionID str
 	if err := r.Boot.Audit.WriteTx(ctx, tx, "user:miniapp", "REQUEST_CLOSE", positionID,
 		map[string]string{"position_id": positionID}, "queued"); err != nil {
 		return err
+	}
+	producer := outbox.Producer{}
+	if err := producer.EnqueueTx(ctx, tx, "position", "close_request",
+		CloseRequestPayload{PositionID: positionID, Reason: "operator request via Mini App"}); err != nil {
+		return fmt.Errorf("app: enqueue close request: %w", err)
 	}
 	return tx.Commit(ctx)
 }

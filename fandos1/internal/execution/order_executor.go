@@ -104,13 +104,15 @@ func (e *OrderExecutor) Place(ctx context.Context, req domain.PlaceOrderRequest)
 	}
 
 	// 2. Если ошибка — НЕ retry вслепую. Анализируем тип ошибки.
-	if !errors.Is(err, exchange.ErrTimeout) {
-		// Не таймаут — реальная ошибка (rate limit, unauthorized, invalid symbol).
-		// Возвращаем как есть; retry делает вызывающий по своей политике.
+	// Timeout И network error — транспортные сбои с НЕИЗВЕСТНЫМ исходом:
+	// ордер мог дойти до биржи. Оба идут в QUERY_THEN_DECIDE (раздел 10.2).
+	if !errors.Is(err, exchange.ErrTimeout) && !errors.Is(err, exchange.ErrNetwork) {
+		// Детерминированная ошибка (rate limit, unauthorized, invalid symbol):
+		// ордер точно не создан. Возвращаем как есть; retry — политика вызывающего.
 		return PlaceOrderResult{Err: err}, err
 	}
 
-	// 3. Ack timeout → QUERY: запросить состояние ордера.
+	// 3. Ack timeout / network error → QUERY: запросить состояние ордера.
 	// (раздел 10.2: «при таймауте ack — запросить состояние, не переотправлять вслепую»).
 	queryCtx, cancelQ := context.WithTimeout(ctx, e.timeout)
 	queried, qerr := e.adapter.GetOrder(queryCtx, domain.OrderQuery{

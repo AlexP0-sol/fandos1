@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,12 +19,15 @@ import (
 	"github.com/thecd/fundarbitrage/internal/clocks"
 	"github.com/thecd/fundarbitrage/internal/decimal"
 	"github.com/thecd/fundarbitrage/internal/domain"
+	"github.com/thecd/fundarbitrage/internal/engine"
 	"github.com/thecd/fundarbitrage/internal/exchange"
 	mockexchange "github.com/thecd/fundarbitrage/internal/exchange/mock"
+	"github.com/thecd/fundarbitrage/internal/execution"
 	"github.com/thecd/fundarbitrage/internal/instrument"
 	"github.com/thecd/fundarbitrage/internal/lifecycle"
 	"github.com/thecd/fundarbitrage/internal/marketdata"
 	"github.com/thecd/fundarbitrage/internal/outbox"
+	"github.com/thecd/fundarbitrage/internal/repository"
 	"github.com/thecd/fundarbitrage/internal/scanner"
 )
 
@@ -50,7 +54,9 @@ func run() error {
 	}
 
 	// Стартовые предусловия: в live — жёсткий отказ, в dry_run — наблюдение.
+	preconditionsOK := true
 	if errs := lifecycle.CheckPreconditions(ctx, boot.Preconditions()); len(errs) > 0 {
+		preconditionsOK = false
 		for _, e := range errs {
 			log.Error("precondition failed", "err", e.Error())
 		}
@@ -60,20 +66,76 @@ func run() error {
 		log.Warn("продолжаем в наблюдательном режиме (dry_run): торговля недоступна до устранения предусловий")
 	}
 
-	// Биржи: в dry_run без учётных данных — mock-биржи с демо-данными,
-	// чтобы полный контур scanner→ranking был виден вживую.
-	adapters := map[domain.ExchangeID]exchange.ExchangeAdapter{}
+	// Биржи: dry_run → mock-биржи ВСЕХ 7 площадок с демо-данными (полный контур
+	// scanner→engine виден вживую); live → реальные адаптеры из учётных данных БД.
+	var adapters map[domain.ExchangeID]exchange.ExchangeAdapter
 	if boot.Cold.RunMode == domain.RunModeLive {
-		return fmt.Errorf("live wiring требует учётных данных бирж (ввод через Mini App — этап 12); используйте RUN_MODE=dry_run")
+		adapters, err = app.BuildLiveAdapters(ctx, boot)
+		if err != nil {
+			return fmt.Errorf("live wiring: %w", err)
+		}
+		log.Info("live: адаптеры построены из учётных данных", "exchanges", len(adapters))
+	} else {
+		adapters = map[domain.ExchangeID]exchange.ExchangeAdapter{}
+		for i, ex := range domain.SupportedExchanges() {
+			adapters[ex] = seededMock(ex, i)
+		}
+		log.Info("dry_run: mock-биржи с демо-инструментами", "exchanges", len(adapters))
 	}
-	for _, ex := range []domain.ExchangeID{domain.ExchangeBinance, domain.ExchangeBybit} {
-		adapters[ex] = seededMock(ex)
-	}
-	log.Info("dry_run: mock-биржи с демо-инструментами", "exchanges", len(adapters))
 
 	registry := instrument.New()
 	cache := marketdata.New()
-	scan := scanner.New(registry, cache)
+
+	// Движок исполнения: в наблюдательном режиме сканирует без ордеров.
+	// FANDOS_DEMO_ORDERS=1 — включить ордера в dry_run на mock-биржах для демо
+	// полного цикла (безопасно: реальные биржи в dry_run не строятся вовсе).
+	ordersEnabled := preconditionsOK
+	if boot.Cold.RunMode != domain.RunModeLive && os.Getenv("FANDOS_DEMO_ORDERS") == "1" {
+		ordersEnabled = true
+	}
+	executors := map[domain.ExchangeID]*execution.OrderExecutor{}
+	for ex, a := range adapters {
+		executors[ex] = execution.NewOrderExecutor(a, 3*time.Second)
+	}
+	eng, err := engine.New(engine.Deps{
+		Adapters:  adapters,
+		Executors: executors,
+		Registry:  registry,
+		Cache:     cache,
+		Scanner:   scanner.New(registry, cache),
+		Positions: boot.Positions,
+		Persister: repository.NewPersister(boot.Pool),
+		Orders:    boot.Orders,
+		Halter:    boot.Halter,
+		Log:       log,
+		Clock:     time.Now,
+	}, engine.Config{
+		Scan: scanner.Config{
+			MinQuoteVolume24h:       decimal.FromInt(1000),
+			MinOrderBookDepthUSDT:   decimal.FromInt(100),
+			MaxDataAgeMs:            30_000,
+			MinConfidenceLevel:      domain.ConfidenceLow,
+			MinSecondsBeforeFunding: 60,
+			MinExpectedNetPnL:       decimal.MustFromString("0.5"),
+			TargetQty:               decimal.MustFromString("0.05"),
+			FeeRateBps:              decimal.MustFromString("5"),
+			Horizon:                 24 * time.Hour,
+		},
+		MaxOpenPositions:         1,
+		OrdersEnabled:            ordersEnabled,
+		ProtectionTicks:          2,
+		MaxRequotes:              3,
+		DeltaToleranceBase:       decimal.MustFromString("0.0005"),
+		ExitIfFundingSignChanges: true,
+		Interval:                 5 * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("engine: %w", err)
+	}
+	if err := eng.Restore(ctx); err != nil {
+		return fmt.Errorf("engine restore: %w", err)
+	}
+	log.Info("engine ready", "orders_enabled", ordersEnabled, "restored_open", eng.OpenCount())
 
 	components := []lifecycle.Component{
 		{Name: "ops-http", Run: opsHTTP(boot)},
@@ -85,13 +147,22 @@ func run() error {
 		{Name: "outbox-dispatcher", Run: func(ctx context.Context) error {
 			d := outbox.NewDispatcher(boot.Pool, 8, 2*time.Second)
 			d.Run(ctx, func(ev outbox.Event) error {
+				// Маршрутизация: запрос закрытия из Mini App → движок.
+				if ev.Topic == "position" && ev.Kind == "close_request" {
+					var p app.CloseRequestPayload
+					if jerr := json.Unmarshal(ev.Payload, &p); jerr != nil {
+						return fmt.Errorf("bad close_request payload: %w", jerr)
+					}
+					eng.RequestClose(p.PositionID, p.Reason)
+					return nil
+				}
 				log.Info("outbox event", "topic", ev.Topic, "kind", ev.Kind)
 				return nil
 			}, 2*time.Second)
 			return nil
 		}},
 		{Name: "market-refresh", Run: marketRefreshLoop(boot, adapters, registry, cache)},
-		{Name: "scanner", Run: scannerLoop(boot, scan)},
+		{Name: "engine", Run: eng.Run},
 	}
 
 	// Clock sync — только если заданы NTP-серверы (в контейнере UDP наружу закрыт).
@@ -222,54 +293,10 @@ func marketRefreshLoop(boot *app.Bootstrap, adapters map[domain.ExchangeID]excha
 	}
 }
 
-// scannerLoop — Level 3: оценка кандидатов; в dry_run только логирование+метрики.
-func scannerLoop(boot *app.Bootstrap, scan *scanner.Scanner) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
-		cfg := scanner.Config{
-			MinQuoteVolume24h:       decimal.FromInt(1000),
-			MinOrderBookDepthUSDT:   decimal.FromInt(100),
-			MaxDataAgeMs:            30_000,
-			MinConfidenceLevel:      domain.ConfidenceLow,
-			MinSecondsBeforeFunding: 60,
-			MinExpectedNetPnL:       decimal.MustFromString("0.5"),
-			TargetQty:               decimal.MustFromString("0.05"),
-			FeeRateBps:              decimal.MustFromString("5"),
-			Horizon:                 24 * time.Hour,
-		}
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-t.C:
-				if halted, reason := boot.Halter.IsHalted(); halted {
-					boot.Log.Warn("scanner paused: SAFE_HALT", "reason", reason)
-					continue
-				}
-				cands := scan.Scan(cfg, time.Now())
-				eligible := scanner.EligibleCount(cands)
-				boot.App.ScannerEligibleCandidates.Set(float64(eligible))
-				for _, c := range scanner.Top(cands, 3) {
-					boot.Log.Info("candidate",
-						"asset", string(c.Asset),
-						"long", string(c.LongExchange), "short", string(c.ShortExchange),
-						"net_pnl_usdt", c.PnLBreakdown.Net.String(),
-						"score", c.CompositeScore.StringFixed(3),
-						"secs_to_funding", c.SecondsToFunding,
-					)
-				}
-				if eligible == 0 && len(cands) > 0 {
-					boot.Log.Debug("no eligible candidates", "evaluated", len(cands), "top_reason", cands[0].Reason)
-				}
-			}
-		}
-	}
-}
-
 // seededMock — mock-биржа с демо-инструментами, стаканами и funding-данными
-// (только dry_run: полный контур scanner→ranking виден без реальных бирж).
-func seededMock(ex domain.ExchangeID) *mockexchange.Mock {
+// (только dry_run: полный контур scanner→engine виден без реальных бирж).
+// idx задаёт лёгкий перекос цены/funding между площадками для ненулевого спреда.
+func seededMock(ex domain.ExchangeID, idx int) *mockexchange.Mock {
 	m := mockexchange.New(ex)
 	mk := func(sym, asset string) domain.CanonicalInstrument {
 		return domain.CanonicalInstrument{
@@ -286,13 +313,11 @@ func seededMock(ex domain.ExchangeID) *mockexchange.Mock {
 			FundingIntervalSec: 8 * 3600,
 		}
 	}
-	// Перекос цен и funding между биржами создаёт ненулевой basis + funding-спред.
+	// Перекос цен и funding по индексу площадки создаёт ненулевой basis + funding-спред
+	// (idx=0 — базовая ставка, дальше по возрастанию: max−min спред между любыми двумя биржами).
 	base := map[string]string{"BTC": "50000", "ETH": "2500"}
-	skew, rate := decimal.One, decimal.MustFromString("0.0001")
-	if ex == domain.ExchangeBybit {
-		skew = decimal.MustFromString("1.0006")
-		rate = decimal.MustFromString("0.0005") // short на bybit получает больший funding
-	}
+	skew := decimal.One.Add(decimal.FromInt(int64(idx)).Mul(decimal.MustFromString("0.0002")))
+	rate := decimal.MustFromString("0.0001").Add(decimal.FromInt(int64(idx)).Mul(decimal.MustFromString("0.00008")))
 	var ins []domain.CanonicalInstrument
 	for asset, px := range base {
 		sym := domain.ExchangeSymbol(asset + "USDT")

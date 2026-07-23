@@ -551,3 +551,285 @@ func TestNotifier_AllowsAfterInterval(t *testing.T) {
 		t.Fatalf("после паузы count = %d, хотим 2", *count)
 	}
 }
+
+// ============================================================
+// Stub CredentialsProvider для тестов
+// ============================================================
+
+// fakeCredentialsProvider — тестовый stub CredentialsProvider.
+type fakeCredentialsProvider struct {
+	items               []CredentialDTO
+	savedExchange       string
+	savedKind           string
+	savedAPIKey         string
+	savedAPISecret      string
+	savedPassphrase     string
+	fingerprintToReturn string
+	revokedExchange     string
+	revokedKind         string
+	saveErr             error
+	listErr             error
+	revokeErr           error
+}
+
+func (f *fakeCredentialsProvider) List(_ context.Context) ([]CredentialDTO, error) {
+	return f.items, f.listErr
+}
+
+func (f *fakeCredentialsProvider) Save(_ context.Context, exchange, kind, apiKey, apiSecret, passphrase string) (string, error) {
+	f.savedExchange = exchange
+	f.savedKind = kind
+	f.savedAPIKey = apiKey
+	f.savedAPISecret = apiSecret
+	f.savedPassphrase = passphrase
+	return f.fingerprintToReturn, f.saveErr
+}
+
+func (f *fakeCredentialsProvider) Revoke(_ context.Context, exchange, kind string) error {
+	f.revokedExchange = exchange
+	f.revokedKind = kind
+	return f.revokeErr
+}
+
+// fakeOwnerClaimer — тестовый stub OwnerClaimer.
+type fakeOwnerClaimer struct {
+	claimedID int64
+	result    bool
+	err       error
+}
+
+func (f *fakeOwnerClaimer) ClaimOwner(_ context.Context, telegramID int64) (bool, error) {
+	f.claimedID = telegramID
+	return f.result, f.err
+}
+
+// getAuthToken выполняет /api/auth и возвращает Bearer token.
+func getAuthToken(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	initData := buildValidInitData()
+	authResp := doRequest(t, srv, "POST", "/api/auth", "", "", AuthRequest{InitData: initData})
+	if authResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(authResp.Body)
+		t.Fatalf("auth failed %d: %s", authResp.StatusCode, body)
+	}
+	var ar AuthResponse
+	decodeResp(t, authResp, &ar)
+	return ar.Token
+}
+
+// ============================================================
+// Credentials — GET /api/credentials
+// ============================================================
+
+// TestCredentials_List — GET /api/credentials возвращает список.
+func TestCredentials_List(t *testing.T) {
+	fp := &fakeCredentialsProvider{
+		items: []CredentialDTO{
+			{Exchange: "binance", Kind: "trade", Fingerprint: "ABCD1234...", CreatedAt: time.Now(), Revoked: false},
+		},
+	}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	resp := doRequest(t, srv, "GET", "/api/credentials", token, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /api/credentials = %d; body: %s", resp.StatusCode, body)
+	}
+
+	var items []CredentialDTO
+	decodeResp(t, resp, &items)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, хотим 1", len(items))
+	}
+	if items[0].Exchange != "binance" {
+		t.Errorf("exchange = %q, хотим binance", items[0].Exchange)
+	}
+}
+
+// TestCredentials_List_NilProvider — 501 когда credentials не подключён.
+func TestCredentials_List_NilProvider(t *testing.T) {
+	_, srv := newTestHandler(HandlerDeps{})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	resp := doRequest(t, srv, "GET", "/api/credentials", token, "", nil)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("GET /api/credentials без провайдера = %d, хотим 501", resp.StatusCode)
+	}
+}
+
+// ============================================================
+// Credentials — POST /api/credentials
+// ============================================================
+
+// TestCredentials_Save_201 — POST /api/credentials → 201 с fingerprint; passphrase доходит до провайдера.
+func TestCredentials_Save_201(t *testing.T) {
+	fp := &fakeCredentialsProvider{fingerprintToReturn: "MYFP..."}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+
+	body := saveCredentialRequest{
+		Exchange:   "okx",
+		Kind:       "trade",
+		APIKey:     "my-api-key",
+		APISecret:  "my-api-secret",
+		Passphrase: "my-passphrase",
+	}
+	resp := doRequest(t, srv, "POST", "/api/credentials", token, "idem-save-001", body)
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /api/credentials = %d, хотим 201; body: %s", resp.StatusCode, b)
+	}
+
+	var result saveCredentialResponse
+	decodeResp(t, resp, &result)
+	if result.Fingerprint != "MYFP..." {
+		t.Errorf("fingerprint = %q, хотим MYFP...", result.Fingerprint)
+	}
+
+	// Проверяем что passphrase дошла до провайдера.
+	if fp.savedPassphrase != "my-passphrase" {
+		t.Errorf("passphrase = %q, хотим my-passphrase", fp.savedPassphrase)
+	}
+	if fp.savedExchange != "okx" {
+		t.Errorf("exchange = %q, хотим okx", fp.savedExchange)
+	}
+	if fp.savedKind != "trade" {
+		t.Errorf("kind = %q, хотим trade", fp.savedKind)
+	}
+	if fp.savedAPIKey != "my-api-key" {
+		t.Errorf("apiKey = %q, хотим my-api-key", fp.savedAPIKey)
+	}
+}
+
+// TestCredentials_Save_EmptyAPIKey — пустой apiKey → 400.
+func TestCredentials_Save_EmptyAPIKey(t *testing.T) {
+	fp := &fakeCredentialsProvider{fingerprintToReturn: "MYFP..."}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	body := saveCredentialRequest{Exchange: "binance", Kind: "trade", APIKey: "", APISecret: "secret"}
+	resp := doRequest(t, srv, "POST", "/api/credentials", token, "idem-bad-key", body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("пустой apiKey: статус = %d, хотим 400", resp.StatusCode)
+	}
+}
+
+// TestCredentials_Save_UnknownExchange — неизвестная биржа → 400.
+func TestCredentials_Save_UnknownExchange(t *testing.T) {
+	fp := &fakeCredentialsProvider{fingerprintToReturn: "MYFP..."}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	body := saveCredentialRequest{Exchange: "unknown_exchange", Kind: "trade", APIKey: "k", APISecret: "s"}
+	resp := doRequest(t, srv, "POST", "/api/credentials", token, "idem-bad-exch", body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("неизвестная биржа: статус = %d, хотим 400", resp.StatusCode)
+	}
+}
+
+// TestCredentials_Save_NilProvider — 501 когда credentials не подключён.
+func TestCredentials_Save_NilProvider(t *testing.T) {
+	_, srv := newTestHandler(HandlerDeps{})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	body := saveCredentialRequest{Exchange: "binance", Kind: "trade", APIKey: "k", APISecret: "s"}
+	resp := doRequest(t, srv, "POST", "/api/credentials", token, "idem-nil", body)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("nil provider: статус = %d, хотим 501", resp.StatusCode)
+	}
+}
+
+// TestCredentials_Save_InvalidKind — неверный kind → 400.
+func TestCredentials_Save_InvalidKind(t *testing.T) {
+	fp := &fakeCredentialsProvider{}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	body := saveCredentialRequest{Exchange: "binance", Kind: "invalid", APIKey: "k", APISecret: "s"}
+	resp := doRequest(t, srv, "POST", "/api/credentials", token, "idem-bad-kind", body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("неверный kind: статус = %d, хотим 400", resp.StatusCode)
+	}
+}
+
+// ============================================================
+// Credentials — DELETE /api/credentials/{exchange}/{kind}
+// ============================================================
+
+// TestCredentials_Revoke_204 — DELETE /api/credentials/binance/trade → 204.
+func TestCredentials_Revoke_204(t *testing.T) {
+	fp := &fakeCredentialsProvider{}
+	_, srv := newTestHandler(HandlerDeps{Credentials: fp})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	resp := doRequest(t, srv, "DELETE", "/api/credentials/binance/trade", token, "", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("DELETE /api/credentials/binance/trade = %d, хотим 204; body: %s", resp.StatusCode, b)
+	}
+
+	if fp.revokedExchange != "binance" {
+		t.Errorf("revokedExchange = %q, хотим binance", fp.revokedExchange)
+	}
+	if fp.revokedKind != "trade" {
+		t.Errorf("revokedKind = %q, хотим trade", fp.revokedKind)
+	}
+}
+
+// TestCredentials_Revoke_NilProvider — 501 когда credentials не подключён.
+func TestCredentials_Revoke_NilProvider(t *testing.T) {
+	_, srv := newTestHandler(HandlerDeps{})
+	defer srv.Close()
+
+	token := getAuthToken(t, srv)
+	resp := doRequest(t, srv, "DELETE", "/api/credentials/binance/trade", token, "", nil)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("nil provider revoke: статус = %d, хотим 501", resp.StatusCode)
+	}
+}
+
+// ============================================================
+// ClaimOwner — вызывается при auth
+// ============================================================
+
+// TestClaimOwner_CalledOnAuth — ClaimOwner вызывается при auth; claimed=true → нет ошибки.
+func TestClaimOwner_CalledOnAuth(t *testing.T) {
+	owner := &fakeOwnerClaimer{result: true}
+	_, srv := newTestHandler(HandlerDeps{Owner: owner})
+	defer srv.Close()
+
+	initData := buildValidInitData()
+	resp := doRequest(t, srv, "POST", "/api/auth", "", "", AuthRequest{InitData: initData})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("auth = %d; body: %s", resp.StatusCode, body)
+	}
+
+	// Проверяем что ClaimOwner вызван с корректным telegram_id.
+	if owner.claimedID != testUserID {
+		t.Errorf("ClaimOwner вызван с telegramID=%d, хотим %d", owner.claimedID, testUserID)
+	}
+}
+
+// TestClaimOwner_NilOwner — auth работает без Owner (nil-safe).
+func TestClaimOwner_NilOwner(t *testing.T) {
+	_, srv := newTestHandler(HandlerDeps{})
+	defer srv.Close()
+
+	initData := buildValidInitData()
+	resp := doRequest(t, srv, "POST", "/api/auth", "", "", AuthRequest{InitData: initData})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("auth без Owner = %d; body: %s", resp.StatusCode, body)
+	}
+}
