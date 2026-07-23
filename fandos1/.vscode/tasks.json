@@ -2,6 +2,21 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "🚀 fandos: гид по настройке",
+      "detail": "Проверит окружение, создаст .env, соберёт проект и покажет, что делать дальше.",
+      "type": "shell",
+      "command": "bash scripts/setup.sh",
+      "windows": { "command": "powershell -ExecutionPolicy Bypass -File scripts/setup.ps1" },
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "runOptions": { "runOn": "folderOpen" }
+    },
+    {
       "label": "go: build all",
       "type": "shell",
       "command": "go build ./...",
@@ -36,7 +51,7 @@
       "label": "db: применить миграции",
       "type": "shell",
       "command": "for f in migrations/000*_*.sql; do echo \"=> $f\"; psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\" || exit 1; done",
-      "options": { "env": { "DATABASE_URL": "${env:DATABASE_URL}" } },
+      "windows": { "command": "Get-ChildItem migrations/000*_*.sql | Sort-Object Name | ForEach-Object { Write-Host \"=> $($_.Name)\"; psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f $_.FullName }" },
       "problemMatcher": []
     }
   ]

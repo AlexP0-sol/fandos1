@@ -7,7 +7,10 @@
   },
   "go.lintTool": "govet",
   "go.formatTool": "gofmt",
-  "go.testFlags": ["-count=1", "-v"],
+  "go.testFlags": [
+    "-count=1",
+    "-v"
+  ],
   "go.testTimeout": "120s",
   "go.buildOnSave": "package",
   "go.vetOnSave": "package",
@@ -15,12 +18,17 @@
     "editor.formatOnSave": true,
     "editor.insertSpaces": false,
     "editor.tabSize": 4,
-    "editor.codeActionsOnSave": { "source.organizeImports": "explicit" }
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    }
   },
-  "[sql]": { "editor.tabSize": 4 },
+  "[sql]": {
+    "editor.tabSize": 4
+  },
   "files.eol": "\n",
   "search.exclude": {
     "**/bin": true,
     "**/*.md": false
-  }
+  },
+  "task.allowAutomaticTasks": "on"
 }
